@@ -31,6 +31,32 @@ class Attitude(BaseModel):
     yaw_deg: float | None
 
 
+class PiHealth(BaseModel):
+    """The Raspberry Pi's own health. Every field is optional: off a Pi, or on
+    a kernel without the reading, it is simply not known.
+
+    `*_now` is the firmware's state at the moment of reading; `*_since_boot`
+    is sticky, so a brownout that has already passed still shows.
+    """
+
+    cpu_temp_c: float | None
+    load_1m: float | None
+    memory_available_mb: int | None
+    memory_available_percent: int | None
+    disk_free_mb: int | None
+    disk_free_percent: int | None
+    throttled_raw: str | None
+    undervoltage_now: bool | None
+    freq_capped_now: bool | None
+    throttled_now: bool | None
+    soft_temp_limit_now: bool | None
+    undervoltage_since_boot: bool | None
+    freq_capped_since_boot: bool | None
+    throttled_since_boot: bool | None
+    soft_temp_limit_since_boot: bool | None
+    warnings: list[str]
+
+
 class VehicleHealthResponse(BaseModel):
     status: str
     service: str
@@ -47,6 +73,7 @@ class VehicleStatusResponse(BaseModel):
     components: dict[str, ComponentStatus]
     battery: Battery
     attitude: Attitude
+    pi: PiHealth
     motor_feedback: list[MotorFeedback]
 
 

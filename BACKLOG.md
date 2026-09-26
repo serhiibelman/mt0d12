@@ -37,17 +37,6 @@ Resource = "arn:aws:iot:${region}:${account}:topic/rover/$${iot:Connection.Thing
 
 Cheap with one rover, painful to retrofit across a fleet.
 
-## 3. Raspberry Pi health telemetry
-
-**Where:** `apps/api/services/vehicle_status.py` · **Size:** S
-
-CPU temperature, load, free RAM, free disk, and the undervoltage/throttling flag
-(`vcgencmd get_throttled`). On a Pi 1 these predict most field failures:
-thermal throttling, a full SD card, a weak USB supply browning out the board.
-
-Cheap to collect, and they explain failures that otherwise look like random
-hangs.
-
 ---
 
 ## Infrastructure

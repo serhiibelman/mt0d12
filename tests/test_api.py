@@ -38,6 +38,15 @@ def test_status_endpoint_reports_battery_and_attitude(build_app) -> None:
     assert payload["attitude"]["roll_deg"] == 0.4
 
 
+def test_status_endpoint_reports_pi_health(build_app) -> None:
+    with TestClient(build_app()) as client:
+        payload = client.get("/status").json()
+
+    assert payload["pi"]["cpu_temp_c"] == 51.5
+    assert payload["pi"]["undervoltage_since_boot"] is True
+    assert payload["pi"]["warnings"] == []
+
+
 def test_start_motors_endpoint(build_app, vehicle_service) -> None:
     with TestClient(build_app()) as client:
         response = client.post("/motors/start", json={"rpm": 120})

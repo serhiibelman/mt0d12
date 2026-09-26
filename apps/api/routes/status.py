@@ -18,5 +18,6 @@ def status(service: VehicleStatusServiceDep) -> VehicleStatusResponse:
         components=snapshot["components"],
         battery=snapshot["battery"],
         attitude=snapshot["attitude"],
+        pi=snapshot["pi"],
         motor_feedback=snapshot["motor_feedback"],
     )

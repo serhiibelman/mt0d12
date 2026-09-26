@@ -44,6 +44,10 @@ If your Raspberry Pi is not reachable as `raspberrypi.local`, update `UDP_HOST` 
 
 1. **A button**: toggle drive mode on or off.
 2. **LB button**: apply brake to all motors and disable drive mode.
+3. **Link-drop stop**: if no packet arrives for 0.5s (Wi-Fi drop, laptop asleep,
+   controller process killed), the vehicle stops all motors and turns drive mode
+   off. When packets resume, press **A** again to drive - a stick still held
+   forward will not move the rover on its own.
 
 ### Driving
 

@@ -1,5 +1,5 @@
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from lib.common.formatting import print_info, print_warning
 from lib.gamepad.udp_receiver import UDPReceiver
@@ -12,6 +12,9 @@ MAX_STEER_RPM = 100  # half of MAX_RPM for gentler turns
 RAMP_STEP = 5
 DEAD_ZONE = 0.1  # ignore axis jitter near center
 LOOP_INTERVAL = 0.05  # 20 Hz
+# The controller sends at 20 Hz whether or not the sticks move, so this much
+# silence is ~10 lost packets in a row: the link is gone, not just lossy.
+LINK_TIMEOUT = 0.5
 
 
 class VehicleController:
@@ -23,32 +26,56 @@ class VehicleController:
         - Right joystick X → steering; blends with base RPM so the same input
           produces differential steering while moving and a tank turn when stopped.
         - 'lb' button      → brake all motors and disable drive mode.
+        - No packet for LINK_TIMEOUT → stop all motors and disable drive mode;
+          'a' must be pressed again once the link is back.
 
     Motor wiring convention (from actuator_test.py):
         RIGHT_SIDE motors receive rpm * -1 to match the physical mounting direction.
     """
 
-    def __init__(self, receiver: UDPReceiver, motor: DDS115):
+    def __init__(
+        self,
+        receiver: UDPReceiver,
+        motor: DDS115,
+        link_timeout: float = LINK_TIMEOUT,
+        time_func: Callable[[], float] = time.monotonic,
+    ):
         self.receiver = receiver
         self.motor = motor
+        self.link_timeout = link_timeout
+        self._now = time_func
         self._current_rpm: float = 0.0
         self._braked: bool = False
         self._drive_enabled: bool = False
         self._prev_a: bool = False  # for edge detection on 'a' toggle
+        # Arrival time on this clock, not the packet's `timestamp`: that one is
+        # stamped by the laptop, whose clock need not agree with the Pi's.
+        self._last_packet_at: Optional[float] = None
+        self._link_lost: bool = False
 
     def run(self):
         """Start the main control loop. Blocks until KeyboardInterrupt."""
         print_info("VehicleController started")
         try:
             while True:
-                state = self._receive_latest()
-                if state is not None:
-                    self._handle(state)
+                self.tick()
                 time.sleep(LOOP_INTERVAL)
         except KeyboardInterrupt:
             print_info("VehicleController stopped")
         finally:
             self._stop_motors()
+
+    def tick(self) -> None:
+        """One loop iteration: act on the newest packet, or fail safe on silence."""
+        state = self._receive_latest()
+        if state is not None:
+            self._last_packet_at = self._now()
+            if self._link_lost:
+                self._link_lost = False
+                print_info("Control link restored - press 'a' to drive")
+            self._handle(state)
+        elif self._link_timed_out():
+            self._fail_safe()
 
     def _receive_latest(self) -> Optional[ControllerState]:
         """
@@ -106,6 +133,33 @@ class VehicleController:
             right_rpm = self._current_rpm
 
         self._apply(left_rpm, right_rpm)
+
+    def _link_timed_out(self) -> bool:
+        """True once packets stop for longer than link_timeout.
+
+        Never true before the first packet: until a controller has spoken the
+        motors have not been commanded, so there is nothing to stop.
+        """
+        if self._link_lost or self._last_packet_at is None:
+            return False
+        return self._now() - self._last_packet_at > self.link_timeout
+
+    def _fail_safe(self) -> None:
+        """Stop the motors and disarm once the control link has gone quiet.
+
+        The motors hold their last commanded RPM, so without this a laptop that
+        sleeps or a Wi-Fi drop mid-drive leaves the rover going at full speed.
+        Stops at once rather than ramping: a ramp from full speed takes seconds
+        of driving blind. Drive stays off until 'a' is pressed again, so a link
+        that comes back with the stick still pushed does not lurch forward.
+        """
+        print_warning(f"Control link lost for >{self.link_timeout:.1f}s - stopping motors")
+        self._link_lost = True
+        self._drive_enabled = False
+        # A held 'a' must be released and pressed again, not read as a fresh press.
+        self._prev_a = True
+        self._current_rpm = 0.0
+        self._stop_motors()
 
     def _compute_side_rpms(self, base_rpm: float, right_x: float) -> tuple[float, float]:
         """

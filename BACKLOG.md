@@ -48,32 +48,6 @@ thermal throttling, a full SD card, a weak USB supply browning out the board.
 Cheap to collect, and they explain failures that otherwise look like random
 hangs.
 
-## 4. Control-link failsafe
-
-**Where:** `apps/vehicle_control/vehicle_controller.py` · **Size:** S
-
-`run()` only acts when a packet arrives:
-
-```python
-state = self._receive_latest()
-if state is not None:
-    self._handle(state)
-time.sleep(LOOP_INTERVAL)
-```
-
-With no packet it sleeps and loops, so the motors hold their last commanded
-RPM. If the laptop sleeps, Wi-Fi drops, or the controller process dies
-mid-drive, the rover keeps going at that speed indefinitely. `_stop_motors()`
-runs only on `KeyboardInterrupt`, which never fires when the *link* dies rather
-than the process.
-
-Track the time of the last accepted packet; past a timeout (~0.5s) stop the
-motors and drop `_drive_enabled` until a fresh packet arrives. Packets already
-carry a `timestamp` field that is parsed and never used.
-
-Deferred by choice, not oversight - worth doing before the rover drives
-anywhere it could hurt something.
-
 ---
 
 ## Infrastructure

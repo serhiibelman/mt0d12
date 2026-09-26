@@ -1,14 +1,109 @@
 # Backlog
 
-Work that is understood but not done. Ordered by what hurts most if it stays
-undone, not by effort. Each item says why it matters and where it lands, so
-picking one up does not mean rediscovering the problem.
+Work that is understood but not done. Each item says why it matters and where
+it lands, so picking one up does not mean rediscovering the problem.
+
+Items 1-7 are an async-programming track and come first by choice: practice
+on real code, with each step also moving the rover toward being driven from a
+browser. Everything after them is ordered by what hurts most if it stays
+undone, not by effort.
 
 Repos: `r2d2` (this one, the vehicle) and `r2d2-infrastructure` (AWS).
 
 ---
 
-## 1. Last Will and Testament
+## Async track
+
+The vehicle runs on threads and `time.sleep` today: the control loop, the
+telemetry publisher, the status probe and the camera each own one. Every item
+below replaces one of them with its asyncio equivalent, in order of risk - no
+motors until 2, no new hardware until 6. Python 3.11+ (`TaskGroup`,
+`asyncio.timeout`); the Pi's venv is 3.12. Build and test on the laptop with
+fakes first - the suite already fakes motors, the FC link and clocks, and
+`pytest-asyncio` extends that to coroutines.
+
+### 1. Live status over a WebSocket
+
+**Where:** `apps/api/routes/` (new `/ws/status`) · **Size:** S
+
+Push `service.snapshot()` to every connected browser at 5 Hz. Teaches `async`
+endpoints, `await websocket.send_json()`, `asyncio.sleep`, and cleaning up on
+`WebSocketDisconnect`.
+
+Stretch: fan out through one `asyncio.Queue(maxsize=1)` per client, dropping
+the stale update rather than waiting, so a slow viewer never holds up the rest -
+the same newest-wins rule `CameraService` applies to frames.
+
+### 2. Drive commands over the same WebSocket
+
+**Where:** `apps/api/routes/` · **Size:** M
+
+The browser sends stick positions, the rover sends status back: two tasks per
+connection under an `asyncio.TaskGroup`, and cancellation that has to take both
+down cleanly when the socket closes.
+
+The link-drop stop comes with it: `asyncio.timeout(0.5)` around
+`receive_json()`, stopping the motors on expiry - the behaviour
+`VehicleController` already has, expressed as a timeout instead of a timestamp.
+
+### 3. The UDP control loop on asyncio
+
+**Where:** `apps/vehicle_control/vehicle_controller.py` · **Size:** M
+
+Replace `while True: ... time.sleep(LOOP_INTERVAL)` with
+`loop.create_datagram_endpoint()` and a `DatagramProtocol`.
+
+The real lesson is blocking I/O inside the loop: `DDS115.send_rpm()` blocks on
+the serial port and stalls everything else. Measure it with
+`PYTHONASYNCIODEBUG=1`, which logs any step over 100 ms, then fix it with
+`asyncio.to_thread()` or `pyserial-asyncio` (BSD).
+
+### 4. Read the flight controller continuously
+
+**Where:** `apps/api/services/vehicle_status.py` · **Size:** M
+
+The probe reopens the MAVLink link every 2s and reads for 0.6s. Keep it open and
+consume `ATTITUDE` / `SYS_STATUS` as a stream instead: pymavlink wrapped in
+`to_thread`, an `asyncio.Event` for "new reading", and reconnect with backoff
+when the cable comes out. Attitude becomes live rather than up to 2s old.
+
+### 5. Async telemetry publisher
+
+**Where:** `lib/telemetry/publisher.py` · **Size:** M
+
+Rebuild `TelemetryPublisher` on `aiomqtt` (BSD) and `aiosqlite` (MIT) for the
+spool: retries with exponential backoff, `asyncio.timeout` around every network
+call, draining the backlog without blocking new samples, and a shutdown that
+loses nothing. The threaded version and its tests are the specification.
+
+### 6. Ultrasonic sensors: threads into the event loop
+
+**Where:** new `lib/` sensor module, `apps/vehicle_control/` · **Size:** M ·
+**Needs:** 2-3 HC-SR04P
+
+pigpio reports echoes by calling back on its own thread. Getting those readings
+into the loop safely - `loop.call_soon_threadsafe()`, never touching loop state
+from the callback - is the classic bug source this item is for. The payoff is
+an obstacle stop, and the distance data any later mapping needs. pigpio is
+public domain, `gpiozero` BSD. Power the HC-SR04P from 3.3V so its echo is
+safe for the Pi's GPIO without a divider.
+
+### 7. One async process runs everything
+
+**Where:** new `apps/rover/` · **Size:** L
+
+A single asyncio program owning the control loop, sensors, FC reader, telemetry
+and the API, under a supervisor that restarts a task that crashes. Teaches
+structured concurrency across a whole application, priorities (driving never
+waits for telemetry) and shutdown order.
+
+Also the architectural fix: today the API and `vehicle_control` both open the
+motor serial port and whichever starts second gets a 503, and telemetry only
+publishes while the API runs. One process owning the bus ends both.
+
+---
+
+## 8. Last Will and Testament
 
 **Where:** `lib/telemetry/publisher.py` (`_PahoConnection.connect`) · **Size:** XS
 
@@ -21,7 +116,7 @@ which with the 300s idle interval means up to five minutes of ambiguity.
 plus publishing `online` after connect. Retained, so anything subscribing later
 sees current state immediately.
 
-## 2. Scope the IoT policy
+## 9. Scope the IoT policy
 
 **Where:** `r2d2-infrastructure/terraform/iot.tf` · **Size:** S
 

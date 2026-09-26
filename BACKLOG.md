@@ -22,17 +22,16 @@ motors until 2, no new hardware until 6. Python 3.11+ (`TaskGroup`,
 fakes first - the suite already fakes motors, the FC link and clocks, and
 `pytest-asyncio` extends that to coroutines.
 
-### 1. Live status over a WebSocket
+### 1. Fan out /ws/status from one producer
 
-**Where:** `apps/api/routes/` (new `/ws/status`) · **Size:** S
+**Where:** `apps/api/routes/status.py` · **Size:** S
 
-Push `service.snapshot()` to every connected browser at 5 Hz. Teaches `async`
-endpoints, `await websocket.send_json()`, `asyncio.sleep`, and cleaning up on
-`WebSocketDisconnect`.
-
-Stretch: fan out through one `asyncio.Queue(maxsize=1)` per client, dropping
-the stale update rather than waiting, so a slow viewer never holds up the rest -
-the same newest-wins rule `CameraService` applies to frames.
+`/ws/status` is live: each viewer's coroutine takes its own snapshot every
+0.2s. The stretch is one producer task taking one snapshot per tick and handing
+it to every viewer through an `asyncio.Queue(maxsize=1)` each, replacing a
+stale update rather than waiting, so a slow viewer never holds up the rest -
+the same newest-wins rule `CameraService` applies to frames. Teaches a task
+that outlives any one connection, and queues as the boundary between tasks.
 
 ### 2. Drive commands over the same WebSocket
 

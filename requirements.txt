@@ -6,6 +6,10 @@ tqdm==4.67.2
 pymavlink==2.4.49
 fastapi==0.95.2
 uvicorn==0.22.0
+# uvicorn rejects WebSocket upgrades unless a WebSocket library is installed.
+# Pinned to 13.x: uvicorn 0.22 uses the legacy websockets API, which 14.0
+# deprecated. Pure Python fallback, so it installs on the Pi 1 as well.
+websockets==13.1
 pytest==8.3.3
 httpx==0.27.2
 # MQTT to AWS IoT Core. paho is pure Python (EPL-2.0/EDL-1.0), so it installs

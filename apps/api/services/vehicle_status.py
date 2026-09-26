@@ -12,6 +12,7 @@ from pymavlink import mavutil
 from serial import SerialException
 
 from lib.ddsm115 import DDS115
+from apps.api.services.pi_health import PI_HEALTH_UNAVAILABLE, PiHealthReader
 from apps.vehicle_control.vehicle_controller import LOOP_INTERVAL, MAX_RPM, VehicleController
 from settings import DEVICE, FC_BAUDRATE, FC_DEVICE, LEFT_SIDE, RIGHT_SIDE
 
@@ -79,6 +80,7 @@ class VehicleStatusService:
         fc_factory: Callable[..., Any] = mavutil.mavlink_connection,
         fc_read_seconds: float = 0.6,
         sleep_func: Callable[[float], None] = sleep,
+        pi_health_reader: Callable[[], dict[str, Any]] | None = None,
     ):
         self.motor_device = motor_device
         self.fc_device = fc_device
@@ -88,6 +90,7 @@ class VehicleStatusService:
         self._fc_factory = fc_factory
         self.fc_read_seconds = fc_read_seconds
         self._sleep = sleep_func
+        self._read_pi_health = pi_health_reader or PiHealthReader()
         self._stop_event = Event()
         self._lock = Lock()
         self._motor_bus_lock = Lock()
@@ -113,6 +116,7 @@ class VehicleStatusService:
         ]
         self._battery = dict(BATTERY_UNAVAILABLE)
         self._attitude = dict(ATTITUDE_UNAVAILABLE)
+        self._pi = dict(PI_HEALTH_UNAVAILABLE)
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -134,6 +138,7 @@ class VehicleStatusService:
             motor_feedback = list(self._motor_feedback)
             battery = dict(self._battery)
             attitude = dict(self._attitude)
+            pi = dict(self._pi)
 
         return {
             "service": "r2d2-vehicle-api",
@@ -148,6 +153,7 @@ class VehicleStatusService:
             "components": components,
             "battery": battery,
             "attitude": attitude,
+            "pi": pi,
             "motor_feedback": motor_feedback,
         }
 
@@ -179,8 +185,10 @@ class VehicleStatusService:
         without waiting for the next tick."""
         motor_bus = self._probe_motor_bus()
         flight_controller, battery, attitude = self._probe_flight_controller()
+        pi = self._probe_pi()
 
         with self._lock:
+            self._pi = pi
             self._components["motor_bus"] = motor_bus
             self._components["flight_controller"] = flight_controller
             if not flight_controller.connected:
@@ -196,6 +204,15 @@ class VehicleStatusService:
                     self._battery = battery
                 if attitude is not None:
                     self._attitude = attitude
+
+    def _probe_pi(self) -> dict[str, Any]:
+        """The board's own health. Never costs the rest of the probe: a reader
+        that fails outright reports nothing known, like an absent FC."""
+        try:
+            return self._read_pi_health()
+        except Exception as error:
+            logger.warning("Pi health read failed", exc_info=error)
+            return dict(PI_HEALTH_UNAVAILABLE)
 
     def _probe_motor_bus(self) -> ComponentSnapshot:
         checked_at = utc_now()

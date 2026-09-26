@@ -265,6 +265,17 @@ def reset_state():
     STATE["motor_feedback"] = [{"motor_id": 1, "rpm": None}]
     STATE["battery"] = {"voltage_v": 12.4, "current_a": 0.0, "remaining_percent": 76}
     STATE["attitude"] = {"roll_deg": 0.0, "pitch_deg": 0.0, "yaw_deg": 271.3}
+    STATE["pi"] = {
+        "cpu_temp_c": 51.5,
+        "load_1m": 0.42,
+        "memory_available_mb": 210,
+        "memory_available_percent": 48,
+        "disk_free_mb": 5120,
+        "disk_free_percent": 62,
+        "undervoltage_now": False,
+        "undervoltage_since_boot": False,
+        "warnings": [],
+    }
     yield
 
 
@@ -643,3 +654,53 @@ def test_yaw_still_travels_in_the_payload():
     publisher.publish_if_due()
 
     assert json.loads(connection.published[0][1])["snapshot"]["attitude"]["yaw_deg"] == 271.3
+
+
+# -- Pi health against the change detector ----------------------------------
+
+
+def test_drifting_pi_gauges_alone_do_not_wake_a_parked_rover():
+    # Temperature, load and memory move on every reading; counting that as
+    # news would publish every few seconds, like compass drift would.
+    publisher, connection, clock = make_ticking_publisher()
+    publisher.publish_if_due()
+
+    clock["t"] = 10.0
+    STATE["pi"] = {
+        **STATE["pi"],
+        "cpu_temp_c": 53.2,
+        "load_1m": 0.91,
+        "memory_available_mb": 198,
+        "memory_available_percent": 45,
+        "disk_free_mb": 5119,
+    }
+
+    assert publisher.publish_if_due() is False
+    assert len(connection.published) == 1
+
+
+def test_undervoltage_is_news_immediately():
+    publisher, connection, clock = make_ticking_publisher()
+    publisher.publish_if_due()
+
+    clock["t"] = 10.0
+    STATE["pi"] = {
+        **STATE["pi"],
+        "undervoltage_now": True,
+        "undervoltage_since_boot": True,
+        "warnings": ["undervoltage"],
+    }
+
+    assert publisher.publish_if_due() is True
+    assert json.loads(connection.published[1][1])["trigger"] == "change"
+
+
+def test_crossing_a_threshold_is_news_even_though_the_gauge_is_not():
+    publisher, connection, clock = make_ticking_publisher()
+    publisher.publish_if_due()
+
+    clock["t"] = 10.0
+    STATE["pi"] = {**STATE["pi"], "cpu_temp_c": 81.0, "warnings": ["cpu_hot"]}
+
+    assert publisher.publish_if_due() is True
+    assert json.loads(connection.published[1][1])["snapshot"]["pi"]["cpu_temp_c"] == 81.0

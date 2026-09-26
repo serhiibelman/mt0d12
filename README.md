@@ -50,7 +50,7 @@ uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
 Available endpoints:
 
 1. `GET /health` - API and hardware probe health.
-2. `GET /status` - current vehicle snapshot, including configured motor IDs, hardware probe status, battery and attitude.
+2. `GET /status` - current vehicle snapshot, including configured motor IDs, hardware probe status, battery, attitude and Raspberry Pi health.
 3. `POST /motors/start` - ramp all motors to a requested base RPM.
 4. `POST /motors/stop` - ramp all motors down to zero.
 5. `GET /camera/stream` - live MJPEG video from the RPi Camera (B).
@@ -163,6 +163,39 @@ Notes:
    compass drifts on its own and a parked rover would otherwise publish every
    few seconds. `roll_deg` and `pitch_deg` are gravity-referenced and stay put,
    so a vehicle that tips over still reports it at once.
+
+### Raspberry Pi health
+
+The board's own state travels next to battery and attitude, as `pi` in
+`/status` and in every telemetry message. On a Pi 1 these explain most field
+failures that otherwise look like random hangs.
+
+```json
+"pi": {
+  "cpu_temp_c": 51.5, "load_1m": 0.42,
+  "memory_available_mb": 210, "memory_available_percent": 48,
+  "disk_free_mb": 5120, "disk_free_percent": 62,
+  "throttled_raw": "0x50000",
+  "undervoltage_now": false, "undervoltage_since_boot": true,
+  "throttled_now": false, "throttled_since_boot": true,
+  "freq_capped_now": false, "freq_capped_since_boot": false,
+  "soft_temp_limit_now": false, "soft_temp_limit_since_boot": false,
+  "warnings": []
+}
+```
+
+Notes:
+
+1. The throttle flags are the firmware's `vcgencmd get_throttled` word, read
+   from sysfs where the kernel has it and from `vcgencmd` otherwise.
+   `*_since_boot` is sticky: `0x50000` above is a brownout that already passed -
+   the case where Wi-Fi died at boot and nothing on the running Pi said why.
+2. `warnings` lists what needs a look: `undervoltage`, `throttled`, `cpu_hot`
+   (80 C and over), `disk_low` and `memory_low` (under 10% free).
+3. Only the warnings and flags count as a change for telemetry. Temperature,
+   load, memory and disk move on every reading, so like `yaw_deg` they travel
+   in every message but never cause one.
+4. Off a Pi, the readings that do not exist are `null`.
 
 ## 7. Telemetry
 

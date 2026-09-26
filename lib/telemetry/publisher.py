@@ -22,7 +22,23 @@ QOS_AT_LEAST_ONCE = 1
 # its own: left in, a parked rover would publish every few seconds and undo the
 # idle heartbeat. Roll and pitch are gravity-referenced and stay put, so a
 # vehicle that tips over still says so immediately.
-VOLATILE_KEYS = ("timestamp", "checked_at", "last_frame_at", "recorded_at", "yaw_deg")
+#
+# The Pi's own gauges are here for the same reason: temperature, load, memory
+# and disk move on every reading. What counts instead is `pi.warnings` and the
+# throttle flags, so a brownout or a card filling up is still heard at once.
+VOLATILE_KEYS = (
+    "timestamp",
+    "checked_at",
+    "last_frame_at",
+    "recorded_at",
+    "yaw_deg",
+    "cpu_temp_c",
+    "load_1m",
+    "memory_available_mb",
+    "memory_available_percent",
+    "disk_free_mb",
+    "disk_free_percent",
+)
 
 
 def significant(value: Any) -> Any:

@@ -3,7 +3,7 @@
 Work that is understood but not done. Each item says why it matters and where
 it lands, so picking one up does not mean rediscovering the problem.
 
-Items 1-7 are an async-programming track and come first by choice: practice
+Items 1-8 are an async-programming track and come first by choice: practice
 on real code, with each step also moving the rover toward being driven from a
 browser. Everything after them is ordered by what hurts most if it stays
 undone, not by effort.
@@ -17,7 +17,7 @@ Repos: `r2d2` (this one, the vehicle) and `r2d2-infrastructure` (AWS).
 The vehicle runs on threads and `time.sleep` today: the control loop, the
 telemetry publisher, the status probe and the camera each own one. Every item
 below replaces one of them with its asyncio equivalent, in order of risk - no
-motors until 2, no new hardware until 6. Python 3.11+ (`TaskGroup`,
+motors until 2, no new hardware until 7. Python 3.11+ (`TaskGroup`,
 `asyncio.timeout`); the Pi's venv is 3.12. Build and test on the laptop with
 fakes first - the suite already fakes motors, the FC link and clocks, and
 `pytest-asyncio` extends that to coroutines.
@@ -75,7 +75,32 @@ spool: retries with exponential backoff, `asyncio.timeout` around every network
 call, draining the backlog without blocking new samples, and a shutdown that
 loses nothing. The threaded version and its tests are the specification.
 
-### 6. Ultrasonic sensors: threads into the event loop
+### 6. Base station: a local broker and a recorder
+
+**Where:** new `apps/base_station/`, `lib/telemetry/` · **Size:** M ·
+**Needs:** a laptop or spare Pi that stays on
+
+Telemetry reaches Postgres only through AWS. A base station keeps a copy on a
+machine you own, reachable without the cloud: Mosquitto (EPL/EDL) as the
+broker, and a small `aiomqtt` subscriber on `rover/+/telemetry` writing each
+message to Postgres or SQLite - the other end of item 5.
+
+The rover keeps publishing and keeps its spool; only the endpoint changes, so
+the at-least-once delivery the outbox gives still holds. Two things to decide:
+
+- **TLS.** The publisher always does mutual TLS, as AWS requires. Either give
+  Mosquitto certificates the same way, or add a plain mode for a trusted LAN -
+  never for anything leaving it.
+- **Duplicates.** At-least-once means a replayed message can arrive twice; the
+  recorder should upsert on `(thing_name, recorded_at)` rather than insert.
+
+Mosquitto can bridge the same topics on to AWS, so this adds a copy rather
+than replacing the cloud path. Recording stays on MQTT, not `/ws/status`: the
+WebSocket is for a live view and loses whatever arrives while no one is
+connected, and the rover connecting out to a fixed broker survives its own IP
+changing - the station connecting in to the rover does not.
+
+### 7. Ultrasonic sensors: threads into the event loop
 
 **Where:** new `lib/` sensor module, `apps/vehicle_control/` · **Size:** M ·
 **Needs:** 2-3 HC-SR04P
@@ -87,7 +112,7 @@ an obstacle stop, and the distance data any later mapping needs. pigpio is
 public domain, `gpiozero` BSD. Power the HC-SR04P from 3.3V so its echo is
 safe for the Pi's GPIO without a divider.
 
-### 7. One async process runs everything
+### 8. One async process runs everything
 
 **Where:** new `apps/rover/` · **Size:** L
 
@@ -102,7 +127,7 @@ publishes while the API runs. One process owning the bus ends both.
 
 ---
 
-## 8. Last Will and Testament
+## 9. Last Will and Testament
 
 **Where:** `lib/telemetry/publisher.py` (`_PahoConnection.connect`) · **Size:** XS
 
@@ -115,7 +140,7 @@ which with the 300s idle interval means up to five minutes of ambiguity.
 plus publishing `online` after connect. Retained, so anything subscribing later
 sees current state immediately.
 
-## 9. Scope the IoT policy
+## 10. Scope the IoT policy
 
 **Where:** `r2d2-infrastructure/terraform/iot.tf` · **Size:** S
 

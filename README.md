@@ -51,6 +51,7 @@ Available endpoints:
 
 1. `GET /health` - API and hardware probe health.
 2. `GET /status` - current vehicle snapshot, including configured motor IDs, hardware probe status, battery, attitude and Raspberry Pi health.
+   `WS /ws/status` streams the same snapshot, pushed 5 times a second, for a live view without polling.
 3. `POST /motors/start` - ramp all motors to a requested base RPM.
 4. `POST /motors/stop` - ramp all motors down to zero.
 5. `GET /camera/stream` - live MJPEG video from the RPi Camera (B).

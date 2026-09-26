@@ -9,6 +9,8 @@ class FakeVehicleStatusService:
     def __init__(self) -> None:
         self.started_rpms: list[int] = []
         self.stop_calls = 0
+        # Settable so a test can watch a change arrive over /ws/status.
+        self.voltage = 12.4
 
     def start(self) -> None:
         return None
@@ -64,7 +66,7 @@ class FakeVehicleStatusService:
             "fc_device": "/dev/serial0",
             "motor_ids": {"left": [3, 4], "right": [1, 2]},
             "components": components,
-            "battery": {"voltage_v": 12.4, "current_a": 1.83, "remaining_percent": 76},
+            "battery": {"voltage_v": self.voltage, "current_a": 1.83, "remaining_percent": 76},
             "attitude": {"roll_deg": 0.4, "pitch_deg": -1.2, "yaw_deg": 271.3},
             "pi": {
                 "cpu_temp_c": 51.5,

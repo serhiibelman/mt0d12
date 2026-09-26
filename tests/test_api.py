@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 
@@ -125,3 +126,42 @@ def test_camera_start_and_stop_endpoints(build_app, camera_service) -> None:
     assert camera_service.start_calls == 1
     # The app also stops the camera on shutdown.
     assert camera_service.stop_calls == 2
+
+
+# -- /ws/status --------------------------------------------------------------
+
+
+@pytest.fixture()
+def fast_stream(monkeypatch):
+    # 5 Hz is right for a browser; a test does not need to sit through it.
+    monkeypatch.setattr("apps.api.routes.status.STATUS_STREAM_INTERVAL", 0.01)
+
+
+def test_status_stream_sends_the_same_snapshot_as_status(build_app, fast_stream) -> None:
+    with TestClient(build_app()) as client:
+        polled = client.get("/status").json()
+        with client.websocket_connect("/ws/status") as ws:
+            pushed = ws.receive_json()
+
+    # Same schema, same data. The clocks (`timestamp`, `checked_at`) move
+    # between two reads, so the comparison is on everything that does not.
+    assert pushed.keys() == polled.keys()
+    for section in ("battery", "attitude", "pi", "motor_ids", "motor_feedback"):
+        assert pushed[section] == polled[section]
+
+
+def test_status_stream_keeps_pushing(build_app, vehicle_service, fast_stream) -> None:
+    with TestClient(build_app()) as client, client.websocket_connect("/ws/status") as ws:
+        first = ws.receive_json()
+        vehicle_service.voltage = 11.9
+        second = ws.receive_json()
+
+    assert first["battery"]["voltage_v"] == 12.4
+    assert second["battery"]["voltage_v"] == 11.9
+
+
+def test_a_message_from_the_viewer_does_not_break_the_stream(build_app, fast_stream) -> None:
+    with TestClient(build_app()) as client, client.websocket_connect("/ws/status") as ws:
+        ws.receive_json()
+        ws.send_text("hello")
+        assert ws.receive_json()["service"] == "r2d2-vehicle-api"

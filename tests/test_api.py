@@ -131,13 +131,7 @@ def test_camera_start_and_stop_endpoints(build_app, camera_service) -> None:
 # -- /ws/status --------------------------------------------------------------
 
 
-@pytest.fixture()
-def fast_stream(monkeypatch):
-    # 5 Hz is right for a browser; a test does not need to sit through it.
-    monkeypatch.setattr("apps.api.routes.status.STATUS_STREAM_INTERVAL", 0.01)
-
-
-def test_status_stream_sends_the_same_snapshot_as_status(build_app, fast_stream) -> None:
+def test_status_stream_sends_the_same_snapshot_as_status(build_app) -> None:
     with TestClient(build_app()) as client:
         polled = client.get("/status").json()
         with client.websocket_connect("/ws/status") as ws:
@@ -150,7 +144,7 @@ def test_status_stream_sends_the_same_snapshot_as_status(build_app, fast_stream)
         assert pushed[section] == polled[section]
 
 
-def test_status_stream_keeps_pushing(build_app, vehicle_service, fast_stream) -> None:
+def test_status_stream_keeps_pushing(build_app, vehicle_service) -> None:
     with TestClient(build_app()) as client, client.websocket_connect("/ws/status") as ws:
         first = ws.receive_json()
         vehicle_service.voltage = 11.9
@@ -160,8 +154,23 @@ def test_status_stream_keeps_pushing(build_app, vehicle_service, fast_stream) ->
     assert second["battery"]["voltage_v"] == 11.9
 
 
-def test_a_message_from_the_viewer_does_not_break_the_stream(build_app, fast_stream) -> None:
+def test_a_message_from_the_viewer_does_not_break_the_stream(build_app) -> None:
     with TestClient(build_app()) as client, client.websocket_connect("/ws/status") as ws:
         ws.receive_json()
         ws.send_text("hello")
         assert ws.receive_json()["service"] == "r2d2-vehicle-api"
+
+
+def test_two_viewers_watch_at_once(build_app, vehicle_service) -> None:
+    with (
+        TestClient(build_app()) as client,
+        client.websocket_connect("/ws/status") as first,
+        client.websocket_connect("/ws/status") as second,
+    ):
+        first.receive_json()
+        second.receive_json()
+        vehicle_service.voltage = 11.9
+        # Both are fed by the same producer, so both see the change.
+        for ws in (first, second):
+            while ws.receive_json()["battery"]["voltage_v"] != 11.9:
+                pass

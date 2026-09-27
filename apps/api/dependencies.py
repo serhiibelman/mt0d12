@@ -13,6 +13,7 @@ from fastapi import Depends
 from starlette.requests import HTTPConnection
 
 from apps.api.services.camera import CameraService
+from apps.api.services.status_broadcaster import StatusBroadcaster
 from apps.api.services.vehicle_status import VehicleStatusService
 
 
@@ -24,5 +25,10 @@ def get_camera_service(connection: HTTPConnection) -> CameraService:
     return connection.app.state.camera_service
 
 
+def get_status_broadcaster(connection: HTTPConnection) -> StatusBroadcaster:
+    return connection.app.state.status_broadcaster
+
+
 VehicleStatusServiceDep = Annotated[VehicleStatusService, Depends(get_vehicle_status_service)]
 CameraServiceDep = Annotated[CameraService, Depends(get_camera_service)]
+StatusBroadcasterDep = Annotated[StatusBroadcaster, Depends(get_status_broadcaster)]

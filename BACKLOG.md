@@ -203,6 +203,15 @@ that would hurt to lose.
   API sends nothing. Either document it or move the publisher.
 - **Lambda logs nothing on success,** so "it worked" is inferred from the
   absence of a traceback.
+- **uvicorn hangs on shutdown while a WebSocket viewer is connected.** On
+  Python 3.12+ (the Pi's venv), uvicorn 0.22 awaits `server.wait_closed()`,
+  which now waits for open connections, before it closes them - so SIGTERM
+  never finishes while the status page is open, and only SIGKILL stops it.
+  uvicorn 0.54 orders these correctly and ships a sans-I/O implementation on
+  the current websockets API, so the `websockets==13.1` pin and its comment can
+  go too. Both are pure-Python wheels that install on armv6. Check on the Pi:
+  the install, startup time and memory on 512 MB, and a clean SIGTERM with the
+  page open.
 
 ## If the fleet grows past one rover
 

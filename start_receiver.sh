@@ -1,8 +1,8 @@
 #!/bin/bash
 
-echo "[R2D2] Starting receiver"
+echo "[MT0D12] Starting receiver"
 
-cd ~/r2d2 || exit 1
+cd ~/mt0d12 || exit 1
 source .venv-3.12/bin/activate
 
 python -m lib.gamepad.udp_receiver

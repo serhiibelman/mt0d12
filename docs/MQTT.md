@@ -26,14 +26,14 @@ terraform apply
 SSH into the Pi:
 
 ```commandline
-mkdir -p ~/r2d2/certs
-chmod 700 ~/r2d2/certs
+mkdir -p ~/mt0d12/certs
+chmod 700 ~/mt0d12/certs
 ```
 
 We need these three files:
 
 ```
-~/r2d2/certs/
+~/mt0d12/certs/
 ├── device.pem.crt
 ├── private.pem.key
 └── Amazon-root-CA-1.pem
@@ -46,19 +46,19 @@ AWS uses the device certificate + private key for client authentication, and the
 Then copy secrets to the Pi:
 
 ```
-scp secrets/device.pem.crt pi@<PI_IP>:~/r2d2/certs/
-scp secrets/private.pem.key pi@<PI_IP>:~/r2d2/certs/
+scp secrets/device.pem.crt pi@<PI_IP>:~/mt0d12/certs/
+scp secrets/private.pem.key pi@<PI_IP>:~/mt0d12/certs/
 ```
 And on the Pi:
 ```commandline
-chmod 644 ~/r2d2/certs/device.pem.crt
-chmod 600 ~/r2d2/certs/private.pem.key
+chmod 644 ~/mt0d12/certs/device.pem.crt
+chmod 600 ~/mt0d12/certs/private.pem.key
 ```
 ## Step 5 — Root CA
 Download the AWS Root CA separately:
 ```
 wget https://www.amazontrust.com/repository/AmazonRootCA1.pem \
-  -O ~/r2d2/certs/Amazon-root-CA-1.pem
+  -O ~/mt0d12/certs/Amazon-root-CA-1.pem
 ```
 ## install the MQTT client
 ```

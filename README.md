@@ -29,14 +29,14 @@ sudo apt install libopenblas-dev liblapack-dev gfortran -y
 ## 2. Create venv
 
 ```
-python3.11 -m venv ~/r2d2/venv
-source ~/r2d2/venv/bin/activate
+python3.11 -m venv ~/mt0d12/venv
+source ~/mt0d12/venv/bin/activate
 ```
 
 ## 3. Install requirements
 
 ```
-pip install -r ~/r2d2/requirements.txt
+pip install -r ~/mt0d12/requirements.txt
 ```
 
 ## 4. Start vehicle API
@@ -95,7 +95,7 @@ sudo apt install -y python3-picamera2
 The venv on the Pi must be able to see it:
 
 ```
-python3 -m venv --system-site-packages ~/r2d2/venv
+python3 -m venv --system-site-packages ~/mt0d12/venv
 ```
 
 Check the camera is detected before starting the API: `rpicam-hello --list-cameras`.
@@ -103,7 +103,7 @@ Check the camera is detected before starting the API: `rpicam-hello --list-camer
 Watch the stream in a browser, or embed it anywhere an image can go:
 
 ```html
-<img src="http://<vehicle-host>:8000/camera/stream" alt="R2D2 camera">
+<img src="http://<vehicle-host>:8000/camera/stream" alt="MT0D12 camera">
 ```
 
 ```bash

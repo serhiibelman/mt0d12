@@ -8,7 +8,7 @@ on real code, with each step also moving the rover toward being driven from a
 browser. Everything after them is ordered by what hurts most if it stays
 undone, not by effort.
 
-Repos: `r2d2` (this one, the vehicle) and `r2d2-infrastructure` (AWS).
+Repos: `mt0d12` (this one, the vehicle) and `mt0d12-infrastructure` (AWS).
 
 ---
 
@@ -134,7 +134,7 @@ sees current state immediately.
 
 ## 9. Scope the IoT policy
 
-**Where:** `r2d2-infrastructure/terraform/iot.tf` · **Size:** S
+**Where:** `mt0d12-infrastructure/terraform/iot.tf` · **Size:** S
 
 `aws_iot_policy.rover` grants Connect/Publish/Subscribe on `Resource = "*"`.
 Any device certificate can connect under any client ID and read every rover's
@@ -154,7 +154,7 @@ Cheap with one rover, painful to retrofit across a fleet.
 
 ### Terraform state in S3
 
-**Where:** `r2d2-infrastructure/terraform/terraform.tf` · **Size:** S
+**Where:** `mt0d12-infrastructure/terraform/terraform.tf` · **Size:** S
 
 State is a local file on one machine. Only that machine can run terraform, and
 losing the file means terraform forgets it owns the VPC, RDS and IoT thing -
@@ -167,7 +167,7 @@ fixes all three. The bucket must exist first, then `terraform init
 
 ### A way to query the database
 
-**Where:** `r2d2-infrastructure/terraform/` · **Size:** M
+**Where:** `mt0d12-infrastructure/terraform/` · **Size:** M
 
 `rover-db` is private and RDS has no table browser in the console, so there is
 no way to run SQL against it today. The Lambda's `{"stats": true}` mode covers
@@ -178,7 +178,7 @@ An SSM bastion (t4g.nano, IAM role, no inbound ports) plus port forwarding gives
 
 ### Database password in Secrets Manager
 
-**Where:** `r2d2-infrastructure/terraform/lambda.tf` · **Size:** S
+**Where:** `mt0d12-infrastructure/terraform/lambda.tf` · **Size:** S
 
 `var.db_password` is passed to the Lambda as a plain environment variable,
 visible to anyone with console access to the function. Secrets Manager with
@@ -186,7 +186,7 @@ rotation is the upgrade.
 
 ### Harden the RDS instance
 
-**Where:** `r2d2-infrastructure/terraform/database.tf` · **Size:** S
+**Where:** `mt0d12-infrastructure/terraform/database.tf` · **Size:** S
 
 `skip_final_snapshot = true`, no `storage_encrypted`, no backup retention, no
 deletion protection. Fine for a prototype; revisit before anything is stored
@@ -203,6 +203,15 @@ that would hurt to lose.
   API sends nothing. Either document it or move the publisher.
 - **Lambda logs nothing on success,** so "it worked" is inferred from the
   absence of a traceback.
+- **uvicorn hangs on shutdown while a WebSocket viewer is connected.** On
+  Python 3.12+ (the Pi's venv), uvicorn 0.22 awaits `server.wait_closed()`,
+  which now waits for open connections, before it closes them - so SIGTERM
+  never finishes while the status page is open, and only SIGKILL stops it.
+  uvicorn 0.54 orders these correctly and ships a sans-I/O implementation on
+  the current websockets API, so the `websockets==13.1` pin and its comment can
+  go too. Both are pure-Python wheels that install on armv6. Check on the Pi:
+  the install, startup time and memory on 512 MB, and a clean SIGTERM with the
+  page open.
 
 ## If the fleet grows past one rover
 

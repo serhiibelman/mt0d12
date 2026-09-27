@@ -24,7 +24,7 @@ class FakeVehicleStatusService:
         self.started_rpms.append(rpm)
         now = datetime.now(timezone.utc)
         return {
-            "service": "r2d2-vehicle-api",
+            "service": "mt0d12-vehicle-api",
             "action": "start",
             "target_rpm": rpm,
             "current_rpm": rpm,
@@ -36,7 +36,7 @@ class FakeVehicleStatusService:
         self.stop_calls += 1
         now = datetime.now(timezone.utc)
         return {
-            "service": "r2d2-vehicle-api",
+            "service": "mt0d12-vehicle-api",
             "action": "stop",
             "target_rpm": 0,
             "current_rpm": 0,
@@ -61,7 +61,7 @@ class FakeVehicleStatusService:
             },
         }
         return {
-            "service": "r2d2-vehicle-api",
+            "service": "mt0d12-vehicle-api",
             "overall_status": "degraded",
             "timestamp": now,
             "motor_device": "/dev/ttyACM0",
@@ -136,7 +136,7 @@ class FakeCameraService:
     def snapshot(self) -> dict:
         now = datetime.now(timezone.utc)
         return {
-            "service": "r2d2-vehicle-api",
+            "service": "mt0d12-vehicle-api",
             "timestamp": now,
             "running": self.available,
             "clients": 0,
@@ -158,7 +158,7 @@ class FakeCameraService:
     @staticmethod
     def _command(action: str, detail: str, *, running: bool) -> dict:
         return {
-            "service": "r2d2-vehicle-api",
+            "service": "mt0d12-vehicle-api",
             "action": action,
             "running": running,
             "detail": detail,

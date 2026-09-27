@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -75,6 +76,24 @@ class VehicleStatusResponse(BaseModel):
     attitude: Attitude
     pi: PiHealth
     motor_feedback: list[MotorFeedback]
+
+    @classmethod
+    def from_snapshot(cls, snapshot: dict[str, Any]) -> "VehicleStatusResponse":
+        """`VehicleStatusService.snapshot()` as the public schema. Shared by
+        /status and /ws/status so both always say the same thing - and the model
+        is what turns datetimes into JSON, which plain json.dumps cannot."""
+        return cls(
+            service=snapshot["service"],
+            timestamp=snapshot["timestamp"],
+            motor_device=snapshot["motor_device"],
+            fc_device=snapshot["fc_device"],
+            motor_ids=snapshot["motor_ids"],
+            components=snapshot["components"],
+            battery=snapshot["battery"],
+            attitude=snapshot["attitude"],
+            pi=snapshot["pi"],
+            motor_feedback=snapshot["motor_feedback"],
+        )
 
 
 class CameraStatusResponse(BaseModel):

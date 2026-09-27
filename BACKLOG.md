@@ -22,24 +22,30 @@ motors until 2, no new hardware until 7. Python 3.11+ (`TaskGroup`,
 fakes first - the suite already fakes motors, the FC link and clocks, and
 `pytest-asyncio` extends that to coroutines.
 
-### 1. Fan out /ws/status from one producer
+### 1. A status page
 
-**Where:** `apps/api/routes/status.py` · **Size:** S
+**Where:** `apps/api/` (a static page and the route that serves it) · **Size:** S
 
-`/ws/status` is live: each viewer's coroutine takes its own snapshot every
-0.2s. The stretch is one producer task taking one snapshot per tick and handing
-it to every viewer through an `asyncio.Queue(maxsize=1)` each, replacing a
-stale update rather than waiting, so a slow viewer never holds up the rest -
-the same newest-wins rule `CameraService` applies to frames. Teaches a task
-that outlives any one connection, and queues as the boundary between tasks.
+Reading `/ws/status` today means `python -m websockets` or a browser console:
+raw JSON, five times a second. A page served by the API itself - one HTML
+file, plain JavaScript, no build step - opens from any laptop or phone on the
+LAN with nothing to install: battery, attitude, Pi health and component status
+as they change, and a visible "disconnected" when the link drops, with
+reconnect and backoff.
+
+It is also the client item 2 grows into: the same page later sends stick
+positions back over the same socket. Serve it from the Pi rather than a CDN -
+the rover is often on a network without internet.
 
 ### 2. Drive commands over the same WebSocket
 
 **Where:** `apps/api/routes/` · **Size:** M
 
-The browser sends stick positions, the rover sends status back: two tasks per
-connection under an `asyncio.TaskGroup`, and cancellation that has to take both
-down cleanly when the socket closes.
+The browser sends stick positions, the rover sends status back. Each
+connection already runs as two tasks under an `asyncio.TaskGroup` - one
+forwarding status, one listening for the disconnect; the listener becomes the
+command reader, and cancellation has to take both down cleanly, with the motors
+stopped, whichever side fails first.
 
 The link-drop stop comes with it: `asyncio.timeout(0.5)` around
 `receive_json()`, stopping the motors on expiry - the behaviour

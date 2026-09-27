@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 import pytest
 
 from apps.api.main import create_app
+from apps.api.schemas import VehicleStatusResponse
+from apps.api.services.status_broadcaster import StatusBroadcaster
 
 
 class FakeVehicleStatusService:
@@ -182,9 +184,15 @@ def make_camera_service():
 @pytest.fixture()
 def build_app(vehicle_service, camera_service):
     def _build(vehicle=None, camera=None):
+        vehicle = vehicle or vehicle_service
         return create_app(
-            vehicle_status_service=vehicle or vehicle_service,
+            vehicle_status_service=vehicle,
             camera_service=camera or camera_service,
+            # 5 Hz is right for a browser; a test does not need to sit through it.
+            status_broadcaster=StatusBroadcaster(
+                render=lambda: VehicleStatusResponse.from_snapshot(vehicle.snapshot()).json(),
+                interval=0.01,
+            ),
         )
 
     return _build

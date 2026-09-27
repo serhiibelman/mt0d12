@@ -141,7 +141,7 @@ class VehicleStatusService:
             pi = dict(self._pi)
 
         return {
-            "service": "r2d2-vehicle-api",
+            "service": "mt0d12-vehicle-api",
             "overall_status": self._overall_status(components),
             "timestamp": utc_now(),
             "motor_device": self.motor_device,
@@ -403,7 +403,7 @@ class VehicleStatusService:
         self, *, action: str, target_rpm: int, detail: str
     ) -> dict[str, Any]:
         return {
-            "service": "r2d2-vehicle-api",
+            "service": "mt0d12-vehicle-api",
             "action": action,
             "target_rpm": target_rpm,
             "current_rpm": self._current_rpm(),

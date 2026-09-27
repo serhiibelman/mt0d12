@@ -307,7 +307,7 @@ class CameraService:
             last_frame_at = self._last_frame_at
 
         return {
-            "service": "r2d2-vehicle-api",
+            "service": "mt0d12-vehicle-api",
             "timestamp": utc_now(),
             "running": running,
             "clients": clients,
@@ -338,7 +338,7 @@ class CameraService:
         with self._state_lock:
             running = self._running
         return {
-            "service": "r2d2-vehicle-api",
+            "service": "mt0d12-vehicle-api",
             "action": action,
             "running": running,
             "detail": detail,

@@ -50,7 +50,7 @@ def create_app(
             camera.stop()
 
     app = FastAPI(
-        title="R2D2 Vehicle API",
+        title="MT0D12 Vehicle API",
         version="0.1.0",
         lifespan=lifespan,
     )

@@ -8,7 +8,7 @@ def test_health_endpoint(build_app) -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["service"] == "r2d2-vehicle-api"
+    assert payload["service"] == "mt0d12-vehicle-api"
     assert payload["status"] == "degraded"
     assert "motor_bus" in payload["components"]
 
@@ -168,7 +168,7 @@ def test_a_message_from_the_viewer_does_not_break_the_stream(build_app) -> None:
     with TestClient(build_app()) as client, client.websocket_connect("/ws/status") as ws:
         ws.receive_json()
         ws.send_text("hello")
-        assert ws.receive_json()["service"] == "r2d2-vehicle-api"
+        assert ws.receive_json()["service"] == "mt0d12-vehicle-api"
 
 
 def test_two_viewers_watch_at_once(build_app, vehicle_service) -> None:

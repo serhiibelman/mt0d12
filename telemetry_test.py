@@ -75,7 +75,7 @@ def main() -> int:
 
 def _test_snapshot() -> dict:
     return {
-        "service": "r2d2-vehicle-api",
+        "service": "mt0d12-vehicle-api",
         "overall_status": "test",
         "timestamp": datetime.now(timezone.utc),
         "detail": "telemetry_test.py",

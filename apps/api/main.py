@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from apps.api.routes.camera import router as camera_router
 from apps.api.routes.health import router as health_router
 from apps.api.routes.motors import router as motors_router
+from apps.api.routes.pages import router as pages_router
 from apps.api.routes.status import router as status_router
 from apps.api.schemas import VehicleStatusResponse
 from apps.api.services.camera import CameraService
@@ -54,16 +55,10 @@ def create_app(
         lifespan=lifespan,
     )
 
-    @app.get("/")
-    def root() -> dict[str, str]:
-        return {
-            "service": "r2d2-vehicle-api",
-            "status": "ok",
-        }
-
     app.include_router(camera_router)
     app.include_router(health_router)
     app.include_router(motors_router)
+    app.include_router(pages_router)
     app.include_router(status_router)
     return app
 

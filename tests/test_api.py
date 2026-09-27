@@ -128,6 +128,16 @@ def test_camera_start_and_stop_endpoints(build_app, camera_service) -> None:
     assert camera_service.stop_calls == 2
 
 
+def test_root_serves_the_status_page(build_app) -> None:
+    with TestClient(build_app()) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    # The page is only useful if it talks to the stream this API serves.
+    assert "/ws/status" in response.text
+
+
 # -- /ws/status --------------------------------------------------------------
 
 

@@ -47,9 +47,14 @@ Run on the vehicle:
 uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
 ```
 
+Open `http://<vehicle-host>:8000/` in a browser for the status page: battery, attitude,
+components and Pi health, live over `/ws/status`. It needs nothing but the Pi, so it works
+on a network without internet.
+
 Available endpoints:
 
 1. `GET /health` - API and hardware probe health.
+   `GET /` serves the status page.
 2. `GET /status` - current vehicle snapshot, including configured motor IDs, hardware probe status, battery, attitude and Raspberry Pi health.
    `WS /ws/status` streams the same snapshot, pushed 5 times a second, for a live view without polling.
 3. `POST /motors/start` - ramp all motors to a requested base RPM.

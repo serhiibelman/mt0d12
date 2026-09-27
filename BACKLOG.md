@@ -3,7 +3,7 @@
 Work that is understood but not done. Each item says why it matters and where
 it lands, so picking one up does not mean rediscovering the problem.
 
-Items 1-8 are an async-programming track and come first by choice: practice
+Items 1-7 are an async-programming track and come first by choice: practice
 on real code, with each step also moving the rover toward being driven from a
 browser. Everything after them is ordered by what hurts most if it stays
 undone, not by effort.
@@ -16,32 +16,18 @@ Repos: `r2d2` (this one, the vehicle) and `r2d2-infrastructure` (AWS).
 
 The vehicle runs on threads and `time.sleep` today: the control loop, the
 telemetry publisher, the status probe and the camera each own one. Every item
-below replaces one of them with its asyncio equivalent, in order of risk - no
-motors until 2, no new hardware until 7. Python 3.11+ (`TaskGroup`,
+below replaces one of them with its asyncio equivalent, in order of risk -
+motors from item 1 on, no new hardware until 6. Python 3.11+ (`TaskGroup`,
 `asyncio.timeout`); the Pi's venv is 3.12. Build and test on the laptop with
 fakes first - the suite already fakes motors, the FC link and clocks, and
 `pytest-asyncio` extends that to coroutines.
 
-### 1. A status page
-
-**Where:** `apps/api/` (a static page and the route that serves it) · **Size:** S
-
-Reading `/ws/status` today means `python -m websockets` or a browser console:
-raw JSON, five times a second. A page served by the API itself - one HTML
-file, plain JavaScript, no build step - opens from any laptop or phone on the
-LAN with nothing to install: battery, attitude, Pi health and component status
-as they change, and a visible "disconnected" when the link drops, with
-reconnect and backoff.
-
-It is also the client item 2 grows into: the same page later sends stick
-positions back over the same socket. Serve it from the Pi rather than a CDN -
-the rover is often on a network without internet.
-
-### 2. Drive commands over the same WebSocket
+### 1. Drive commands over the same WebSocket
 
 **Where:** `apps/api/routes/` · **Size:** M
 
-The browser sends stick positions, the rover sends status back. Each
+The status page (`apps/api/static/status.html`, served at `/`) gains the
+controls: the browser sends stick positions, the rover sends status back. Each
 connection already runs as two tasks under an `asyncio.TaskGroup` - one
 forwarding status, one listening for the disconnect; the listener becomes the
 command reader, and cancellation has to take both down cleanly, with the motors
@@ -51,7 +37,7 @@ The link-drop stop comes with it: `asyncio.timeout(0.5)` around
 `receive_json()`, stopping the motors on expiry - the behaviour
 `VehicleController` already has, expressed as a timeout instead of a timestamp.
 
-### 3. The UDP control loop on asyncio
+### 2. The UDP control loop on asyncio
 
 **Where:** `apps/vehicle_control/vehicle_controller.py` · **Size:** M
 
@@ -63,7 +49,7 @@ the serial port and stalls everything else. Measure it with
 `PYTHONASYNCIODEBUG=1`, which logs any step over 100 ms, then fix it with
 `asyncio.to_thread()` or `pyserial-asyncio` (BSD).
 
-### 4. Read the flight controller continuously
+### 3. Read the flight controller continuously
 
 **Where:** `apps/api/services/vehicle_status.py` · **Size:** M
 
@@ -72,7 +58,7 @@ consume `ATTITUDE` / `SYS_STATUS` as a stream instead: pymavlink wrapped in
 `to_thread`, an `asyncio.Event` for "new reading", and reconnect with backoff
 when the cable comes out. Attitude becomes live rather than up to 2s old.
 
-### 5. Async telemetry publisher
+### 4. Async telemetry publisher
 
 **Where:** `lib/telemetry/publisher.py` · **Size:** M
 
@@ -81,7 +67,7 @@ spool: retries with exponential backoff, `asyncio.timeout` around every network
 call, draining the backlog without blocking new samples, and a shutdown that
 loses nothing. The threaded version and its tests are the specification.
 
-### 6. Base station: a local broker and a recorder
+### 5. Base station: a local broker and a recorder
 
 **Where:** new `apps/base_station/`, `lib/telemetry/` · **Size:** M ·
 **Needs:** a laptop or spare Pi that stays on
@@ -89,7 +75,7 @@ loses nothing. The threaded version and its tests are the specification.
 Telemetry reaches Postgres only through AWS. A base station keeps a copy on a
 machine you own, reachable without the cloud: Mosquitto (EPL/EDL) as the
 broker, and a small `aiomqtt` subscriber on `rover/+/telemetry` writing each
-message to Postgres or SQLite - the other end of item 5.
+message to Postgres or SQLite - the other end of item 4.
 
 The rover keeps publishing and keeps its spool; only the endpoint changes, so
 the at-least-once delivery the outbox gives still holds. Two things to decide:
@@ -106,7 +92,7 @@ WebSocket is for a live view and loses whatever arrives while no one is
 connected, and the rover connecting out to a fixed broker survives its own IP
 changing - the station connecting in to the rover does not.
 
-### 7. Ultrasonic sensors: threads into the event loop
+### 6. Ultrasonic sensors: threads into the event loop
 
 **Where:** new `lib/` sensor module, `apps/vehicle_control/` · **Size:** M ·
 **Needs:** 2-3 HC-SR04P
@@ -118,7 +104,7 @@ an obstacle stop, and the distance data any later mapping needs. pigpio is
 public domain, `gpiozero` BSD. Power the HC-SR04P from 3.3V so its echo is
 safe for the Pi's GPIO without a divider.
 
-### 8. One async process runs everything
+### 7. One async process runs everything
 
 **Where:** new `apps/rover/` · **Size:** L
 
@@ -133,7 +119,7 @@ publishes while the API runs. One process owning the bus ends both.
 
 ---
 
-## 9. Last Will and Testament
+## 8. Last Will and Testament
 
 **Where:** `lib/telemetry/publisher.py` (`_PahoConnection.connect`) · **Size:** XS
 
@@ -146,7 +132,7 @@ which with the 300s idle interval means up to five minutes of ambiguity.
 plus publishing `online` after connect. Retained, so anything subscribing later
 sees current state immediately.
 
-## 10. Scope the IoT policy
+## 9. Scope the IoT policy
 
 **Where:** `r2d2-infrastructure/terraform/iot.tf` · **Size:** S
 

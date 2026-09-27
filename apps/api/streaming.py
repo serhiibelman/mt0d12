@@ -1,15 +1,24 @@
-"""Plumbing for WebSocket routes that push updates from a queue.
+"""Plumbing for routes that stream to a viewer until they leave.
 
-A route decides what to stream; `forward_until_disconnect` does the part every
-such route shares - sending while listening for the viewer to leave - so the
-route itself stays a few lines long.
+A route decides what to stream; the functions here do the sending and notice
+the viewer going away, so the route itself stays a few lines long.
+
+- `forward_until_disconnect`: WebSocket, messages from a queue (/ws/status).
+- `mjpeg_parts`: HTTP multipart, JPEG frames from the camera (/camera/stream).
 """
 
 import asyncio
+from collections.abc import AsyncIterator
 
-from fastapi import WebSocket
+from fastapi import Request, WebSocket
+from fastapi.concurrency import run_in_threadpool
 
 from apps.api.exceptions import ViewerLeft
+from apps.api.services.camera import CameraService
+
+# Separates the JPEGs in a multipart/x-mixed-replace body; the route puts the
+# same value in the Content-Type header.
+MJPEG_BOUNDARY = "FRAME"
 
 
 async def forward_until_disconnect(websocket: WebSocket, updates: asyncio.Queue[str]) -> None:
@@ -42,3 +51,30 @@ async def _listen_until_disconnect(websocket: WebSocket) -> None:
         message = await websocket.receive()
         if message["type"] == "websocket.disconnect":
             raise ViewerLeft
+
+
+async def mjpeg_parts(request: Request, service: CameraService) -> AsyncIterator[bytes]:
+    """Yield MJPEG parts until the camera stops or the viewer goes away.
+
+    The frame wait is blocking, so it runs in a worker thread; the generator
+    itself stays async so a disconnect reliably reaches the ``finally`` and
+    hands the viewer slot back.
+    """
+    try:
+        last_seq = -1
+        while not await request.is_disconnected():
+            try:
+                result = await run_in_threadpool(service.next_frame, last_seq)
+            except RuntimeError:
+                # The camera died mid-stream; /camera/status carries the reason.
+                break
+            if result is None:
+                break
+            last_seq, frame = result
+            yield (
+                f"--{MJPEG_BOUNDARY}\r\n"
+                f"Content-Type: image/jpeg\r\n"
+                f"Content-Length: {len(frame)}\r\n\r\n"
+            ).encode() + frame + b"\r\n"
+    finally:
+        service.release_client_slot()

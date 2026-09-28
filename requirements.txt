@@ -16,3 +16,9 @@ httpx==0.27.2
 # on the Pi 1 (armv6); awsiotsdk pulls the awscrt C extension, which has no
 # 32-bit ARM wheel and would have to be compiled on the board.
 paho-mqtt==2.1.0
+# The telemetry publisher runs on the API's event loop: aiomqtt (BSD) is paho
+# driven by asyncio, and aiosqlite (MIT) puts the spool's SQLite calls on a
+# worker thread. Both pure Python, no dependencies beyond paho, so both install
+# on the Pi 1 as they are.
+aiomqtt==2.5.1
+aiosqlite==0.22.1

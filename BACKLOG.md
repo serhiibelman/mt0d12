@@ -3,7 +3,7 @@
 Work that is understood but not done. Each item says why it matters and where
 it lands, so picking one up does not mean rediscovering the problem.
 
-Items 1-4 are an async-programming track and come first by choice: practice
+Items 1-3 are an async-programming track and come first by choice: practice
 on real code, with each step also moving the rover toward being driven from a
 browser. Everything after them is ordered by what hurts most if it stays
 undone, not by effort.
@@ -14,25 +14,15 @@ Repos: `mt0d12` (this one, the vehicle) and `mt0d12-infrastructure` (AWS).
 
 ## Async track
 
-The gamepad control loop and the flight controller reader run on asyncio now.
-Still on threads and `time.sleep`: the telemetry publisher, the status probe
-(motor bus and Pi health) and the camera. Every item below replaces one of them
-with its asyncio equivalent or builds on the result, in order of risk - no new
-hardware until 3. Python 3.11+ (`TaskGroup`,
+The gamepad control loop, the flight controller reader and the telemetry
+publisher run on asyncio now. Still on threads: the status probe (motor bus and
+Pi health) and the camera. Every item below builds on that, in order of risk -
+no new hardware until 2. Python 3.11+ (`TaskGroup`,
 `asyncio.timeout`); the Pi's venv is 3.12. Build and test on the laptop with
 fakes first - the suite already fakes motors, the FC link and clocks, and
 `pytest-asyncio` extends that to coroutines.
 
-### 1. Async telemetry publisher
-
-**Where:** `lib/telemetry/publisher.py` · **Size:** M
-
-Rebuild `TelemetryPublisher` on `aiomqtt` (BSD) and `aiosqlite` (MIT) for the
-spool: retries with exponential backoff, `asyncio.timeout` around every network
-call, draining the backlog without blocking new samples, and a shutdown that
-loses nothing. The threaded version and its tests are the specification.
-
-### 2. Base station: a local broker and a recorder
+### 1. Base station: a local broker and a recorder
 
 **Where:** new `apps/base_station/`, `lib/telemetry/` · **Size:** M ·
 **Needs:** a laptop or spare Pi that stays on
@@ -40,7 +30,8 @@ loses nothing. The threaded version and its tests are the specification.
 Telemetry reaches Postgres only through AWS. A base station keeps a copy on a
 machine you own, reachable without the cloud: Mosquitto (EPL/EDL) as the
 broker, and a small `aiomqtt` subscriber on `rover/+/telemetry` writing each
-message to Postgres or SQLite - the other end of item 1.
+message to Postgres or SQLite - the other end of the async telemetry
+publisher.
 
 The rover keeps publishing and keeps its spool; only the endpoint changes, so
 the at-least-once delivery the outbox gives still holds. Two things to decide:
@@ -57,7 +48,7 @@ WebSocket is for a live view and loses whatever arrives while no one is
 connected, and the rover connecting out to a fixed broker survives its own IP
 changing - the station connecting in to the rover does not.
 
-### 3. Ultrasonic sensors: threads into the event loop
+### 2. Ultrasonic sensors: threads into the event loop
 
 **Where:** new `lib/` sensor module, `apps/vehicle_control/` · **Size:** M ·
 **Needs:** 2-3 HC-SR04P
@@ -69,7 +60,7 @@ an obstacle stop, and the distance data any later mapping needs. pigpio is
 public domain, `gpiozero` BSD. Power the HC-SR04P from 3.3V so its echo is
 safe for the Pi's GPIO without a divider.
 
-### 4. One async process runs everything
+### 3. One async process runs everything
 
 **Where:** new `apps/rover/` · **Size:** L
 
@@ -84,20 +75,20 @@ publishes while the API runs. One process owning the bus ends both.
 
 ---
 
-## 5. Last Will and Testament
+## 4. Last Will and Testament
 
-**Where:** `lib/telemetry/publisher.py` (`_PahoConnection.connect`) · **Size:** XS
+**Where:** `lib/telemetry/publisher.py` (`_AiomqttConnection.connect`) · **Size:** XS
 
 Register an "offline" message at connect time and the broker publishes it the
 instant the connection drops - including on power loss, where the Pi gets no
 chance to say anything. Today offline is inferred from missing heartbeats,
 which with the 300s idle interval means up to five minutes of ambiguity.
 
-`client.will_set(topic=f"rover/{thing}/status", payload="offline", retain=True)`,
+`aiomqtt.Client(..., will=aiomqtt.Will(f"rover/{thing}/status", "offline", qos=1, retain=True))`,
 plus publishing `online` after connect. Retained, so anything subscribing later
 sees current state immediately.
 
-## 6. Scope the IoT policy
+## 5. Scope the IoT policy
 
 **Where:** `mt0d12-infrastructure/terraform/iot.tf` · **Size:** S
 

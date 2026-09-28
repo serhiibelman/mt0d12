@@ -62,7 +62,7 @@ wget https://www.amazontrust.com/repository/AmazonRootCA1.pem \
 ```
 ## install the MQTT client
 ```
-python -c "import paho.mqtt.client; print('paho-mqtt OK')"
+python -c "import aiomqtt, aiosqlite, paho.mqtt.client; print('MQTT client OK')"
 ```
 ## Check AWS
 In AWS IoT Core → MQTT test client:

@@ -12,6 +12,7 @@ IoT Core right now", so a failure has to be a failure, not a message parked in
 the vehicle's spool for the API to deliver later.
 """
 
+import asyncio
 import logging
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -61,7 +62,8 @@ def main() -> int:
         return 1
 
     print_info(f"\nPublishing one message to {config.resolved_topic} ...")
-    if not publisher.publish_once(trigger="test"):
+    sent = asyncio.run(_publish_one(publisher))
+    if not sent:
         print_error("Publish failed - see the warning above for the reason.")
         print_warning("Common causes: the certificate is not attached to the")
         print_warning("thing or policy, the endpoint is wrong, or the clock is off.")
@@ -69,8 +71,14 @@ def main() -> int:
 
     print_success("Published. It should appear in the IoT Core MQTT test client")
     print_success(f"if you are subscribed to {config.resolved_topic} or rover/#")
-    publisher.stop()
     return 0
+
+
+async def _publish_one(publisher: TelemetryPublisher) -> bool:
+    try:
+        return await publisher.publish_once(trigger="test")
+    finally:
+        await publisher.stop()
 
 
 def _test_snapshot() -> dict:

@@ -43,14 +43,14 @@ def create_app(
         app.state.drive_link_timeout = drive_link_timeout
         service.start()
         await service.start_streams()
-        telemetry.start()
+        await telemetry.start()
         # The camera opens on the first stream/snapshot request instead of at
         # boot, so the sensor stays powered down while nobody is watching.
         try:
             yield
         finally:
             await broadcaster.stop()
-            telemetry.stop()
+            await telemetry.stop()
             await service.stop_streams()
             service.stop()
             camera.stop()

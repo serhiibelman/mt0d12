@@ -1,8 +1,15 @@
+import json
+
 from fastapi import APIRouter, WebSocket
 
-from apps.api.dependencies import StatusBroadcasterDep, VehicleStatusServiceDep
+from apps.api.dependencies import (
+    DriveLinkTimeoutDep,
+    StatusBroadcasterDep,
+    VehicleStatusServiceDep,
+)
 from apps.api.schemas import VehicleStatusResponse
-from apps.api.streaming import forward_until_disconnect
+from apps.api.services.drive import DriveSession
+from apps.api.streaming import locked_sender, serve_until_disconnect
 
 router = APIRouter()
 
@@ -13,12 +20,26 @@ def status(service: VehicleStatusServiceDep) -> VehicleStatusResponse:
 
 
 @router.websocket("/ws/status")
-async def status_stream(websocket: WebSocket, broadcaster: StatusBroadcasterDep) -> None:
-    """The /status snapshot, pushed as it changes; see `StatusBroadcaster`.
+async def status_stream(
+    websocket: WebSocket,
+    broadcaster: StatusBroadcasterDep,
+    service: VehicleStatusServiceDep,
+    link_timeout: DriveLinkTimeoutDep,
+) -> None:
+    """
+    The /status snapshot, pushed as it changes; see `StatusBroadcaster`.
+    The same socket takes drive commands back; see `DriveSession`.
 
     `async def`, so every viewer is a coroutine on the event loop rather than a
     threadpool slot, and nothing in it may block.
     """
     await websocket.accept()
-    with broadcaster.subscribe() as updates:
-        await forward_until_disconnect(websocket, updates)
+    send = locked_sender(websocket)
+    session = DriveSession(service, notify=lambda state: send(json.dumps(state)))
+    try:
+        with broadcaster.subscribe() as updates:
+            await serve_until_disconnect(websocket, send, updates, session, link_timeout)
+    finally:
+        # However the connection ended - the viewer left, a send failed, or
+        # the server is shutting down - a driver's motors stop here.
+        await session.close()

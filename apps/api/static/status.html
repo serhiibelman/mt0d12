@@ -5,7 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MT0D12 Status</title>
 <!--
-  The rover's live status, fed by /ws/status. One file, plain JavaScript, no
+  The rover's live status, fed by /ws/status, and its controls, sent back over
+  the same socket. One file, plain JavaScript, no
   build step and nothing fetched from a CDN: the rover is often on a network
   without internet, so everything the page needs is served by the Pi itself.
 -->
@@ -23,6 +24,7 @@
     --idle: #8a919c;
     --sky: #7fb3e6;
     --ground: #a8815a;
+    --accent: #2b6cb0;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -37,6 +39,7 @@
       --idle: #6f7682;
       --sky: #35618f;
       --ground: #6e5238;
+      --accent: #5a9bdc;
     }
   }
   * { box-sizing: border-box; }
@@ -136,6 +139,54 @@
   th, td { padding: 5px 0; text-align: right; border-top: 1px solid var(--line); }
   th { color: var(--muted); font-weight: 400; border-top: 0; }
   th:first-child, td:first-child { text-align: left; }
+  .drive { grid-column: 1 / -1; }
+  .drive-body { display: flex; flex-wrap: wrap; align-items: center; gap: 16px 24px; }
+  .pad {
+    position: relative;
+    flex: none;
+    width: 180px;
+    height: 180px;
+    border-radius: 50%;
+    background: var(--bg);
+    border: 2px solid var(--line);
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .pad[data-armed="true"] { border-color: var(--accent); }
+  .pad::before, .pad::after { content: ""; position: absolute; background: var(--line); }
+  .pad::before { left: 50%; top: 10%; bottom: 10%; width: 1px; }
+  .pad::after { top: 50%; left: 10%; right: 10%; height: 1px; }
+  .knob {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    z-index: 1;
+    width: 56px;
+    height: 56px;
+    margin: -28px 0 0 -28px;
+    border-radius: 50%;
+    background: var(--idle);
+    pointer-events: none;
+  }
+  .pad[data-armed="true"] .knob { background: var(--accent); }
+  .drive-side { flex: 1; min-width: 200px; }
+  .drive-side dl { margin: 12px 0; }
+  .buttons { display: flex; gap: 8px; }
+  button {
+    flex: 1;
+    padding: 10px 14px;
+    border: 0;
+    border-radius: 8px;
+    font: inherit;
+    font-weight: 600;
+    color: #fff;
+    background: var(--accent);
+    cursor: pointer;
+  }
+  button.stop { background: var(--bad); }
+  button:disabled { opacity: .45; cursor: default; }
+  .hint { margin-top: 8px; color: var(--muted); font-size: 12px; }
   footer { padding: 0 16px 24px; text-align: center; color: var(--muted); font-size: 12px; }
 </style>
 </head>
@@ -148,6 +199,28 @@
 </header>
 
 <main>
+  <section class="drive">
+    <h2>Drive</h2>
+    <div class="drive-body">
+      <div class="pad" id="pad" data-armed="false" aria-label="Joystick: up and down drive, left and right steer">
+        <div class="knob" id="knob"></div>
+      </div>
+      <div class="drive-side">
+        <div><span class="badge" id="drive-badge">Not armed</span></div>
+        <div class="detail" id="drive-detail">Arm to drive. The rover stops if this page goes quiet for half a second.</div>
+        <dl>
+          <dt>Throttle</dt><dd id="drive-throttle">0%</dd>
+          <dt>Steer</dt><dd id="drive-steer">0%</dd>
+        </dl>
+        <div class="buttons">
+          <button id="arm">Arm</button>
+          <button class="stop" id="stop" disabled>Stop</button>
+        </div>
+        <div class="hint">Keys: W A S D or arrows to drive, Space to stop.</div>
+      </div>
+    </div>
+  </section>
+
   <section>
     <h2>Battery</h2>
     <div class="big"><span id="battery-voltage">—</span> <span class="unit">V</span></div>
@@ -241,6 +314,15 @@ let reconnectAt = 0;
 let socketOpenedAt = 0;
 let lastMessageAt = 0;
 
+// -- Driving state: stick sources are combined, the pad winning while held.
+// While armed the page sends a command every 50 ms even with the stick still,
+// because silence is how the rover tells a lost link from a parked stick.
+const DRIVE_INTERVAL_MS = 50;
+let armed = false;
+let armPending = false;
+const padStick = { x: 0, y: 0, held: false };
+const keys = new Set();
+
 const $ = (id) => document.getElementById(id);
 
 // -- Connection -------------------------------------------------------------
@@ -259,9 +341,15 @@ function connect() {
   ws.onmessage = (event) => {
     attempt = 0;
     lastMessageAt = Date.now();
-    render(JSON.parse(event.data));
+    const message = JSON.parse(event.data);
+    // Status updates carry no "type"; drive state does.
+    if (message.type === "drive") setDriveState(message.armed, message.detail);
+    else render(message);
   };
   ws.onclose = () => {
+    // The rover stops a driver's motors when the socket goes, so the page
+    // stops thinking it is armed, whichever end closed it.
+    if (armed || armPending) setDriveState(false, "Connection lost - stopped");
     // A socket this page closed on purpose is already forgotten; only an
     // unexpected close schedules a retry.
     if (socket !== ws) return;
@@ -330,6 +418,114 @@ document.addEventListener("visibilitychange", () => {
     connect();
   }
 });
+
+// -- Driving ----------------------------------------------------------------
+
+function send(message) {
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify(message));
+    return true;
+  }
+  return false;
+}
+
+function stick() {
+  if (padStick.held) return { throttle: padStick.y, steer: padStick.x };
+  const throttle = (keys.has("up") ? 1 : 0) - (keys.has("down") ? 1 : 0);
+  const steer = (keys.has("right") ? 1 : 0) - (keys.has("left") ? 1 : 0);
+  return { throttle, steer };
+}
+
+function setDriveState(isArmed, detail) {
+  armed = isArmed;
+  armPending = false;
+  $("pad").dataset.armed = String(armed);
+  $("arm").disabled = armed;
+  $("stop").disabled = !armed;
+  const driveBadge = $("drive-badge");
+  driveBadge.textContent = armed ? "Armed" : "Not armed";
+  driveBadge.className = `badge ${armed ? "ok" : ""}`.trim();
+  $("drive-detail").textContent = detail;
+}
+
+function arm() {
+  if (armed || armPending) return;
+  if (!send({ type: "arm" })) {
+    setDriveState(false, "Not connected");
+    return;
+  }
+  armPending = true;
+  $("arm").disabled = true;
+  $("drive-detail").textContent = "Arming…";
+}
+
+function stop() {
+  // Sent even when the page thinks it is not armed: a stop is never wrong.
+  send({ type: "stop" });
+}
+
+setInterval(() => {
+  const { throttle, steer } = stick();
+  $("drive-throttle").textContent = `${Math.round(throttle * 100)}%`;
+  $("drive-steer").textContent = `${Math.round(steer * 100)}%`;
+  if (armed) send({ type: "drive", throttle, steer });
+}, DRIVE_INTERVAL_MS);
+
+$("arm").addEventListener("click", arm);
+$("stop").addEventListener("click", stop);
+
+// The pad: a spring-loaded stick. Up is forward, right steers right; the knob
+// is clamped to the circle, and letting go returns it to the centre.
+const pad = $("pad");
+
+function movePad(event) {
+  const box = pad.getBoundingClientRect();
+  const radius = box.width / 2;
+  let x = (event.clientX - box.left - radius) / radius;
+  let y = (box.top + radius - event.clientY) / radius;
+  const length = Math.hypot(x, y);
+  if (length > 1) { x /= length; y /= length; }
+  padStick.x = x;
+  padStick.y = y;
+  $("knob").style.transform = `translate(${x * (radius - 28)}px, ${-y * (radius - 28)}px)`;
+}
+
+function releasePad() {
+  padStick.held = false;
+  padStick.x = padStick.y = 0;
+  $("knob").style.transform = "";
+}
+
+pad.addEventListener("pointerdown", (event) => {
+  pad.setPointerCapture(event.pointerId);
+  padStick.held = true;
+  movePad(event);
+});
+pad.addEventListener("pointermove", (event) => { if (padStick.held) movePad(event); });
+pad.addEventListener("pointerup", releasePad);
+pad.addEventListener("pointercancel", releasePad);
+
+const KEYS = {
+  ArrowUp: "up", KeyW: "up",
+  ArrowDown: "down", KeyS: "down",
+  ArrowLeft: "left", KeyA: "left",
+  ArrowRight: "right", KeyD: "right",
+};
+
+document.addEventListener("keydown", (event) => {
+  if (event.code === "Space") {
+    event.preventDefault();
+    stop();
+    return;
+  }
+  const key = KEYS[event.code];
+  if (!key) return;
+  event.preventDefault();
+  keys.add(key);
+});
+document.addEventListener("keyup", (event) => keys.delete(KEYS[event.code]));
+// A key released while the window was not looking would stay "held" forever.
+window.addEventListener("blur", () => { keys.clear(); releasePad(); });
 
 // -- Rendering --------------------------------------------------------------
 // Everything goes in through textContent, never innerHTML, so nothing in a

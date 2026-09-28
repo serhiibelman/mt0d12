@@ -30,6 +30,8 @@ REMAINING_UNKNOWN = -1  # percent
 BATTERY_UNAVAILABLE = {"voltage_v": None, "current_a": None, "remaining_percent": None}
 ATTITUDE_UNAVAILABLE = {"roll_deg": None, "pitch_deg": None, "yaw_deg": None}
 
+DRIVER_HOLDS_BUS = "Held open by a driver on the status page"
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -94,6 +96,11 @@ class VehicleStatusService:
         self._stop_event = Event()
         self._lock = Lock()
         self._motor_bus_lock = Lock()
+        # Held around every command to the driver's open port, so closing it
+        # waits for a command already on the bus instead of cutting it off.
+        self._drive_lock = Lock()
+        self._drive_motor: DDS115 | None = None
+        self._drive_owner: object | None = None
         self._thread: Thread | None = None
         self._current_command_rpm = 0
         self._components = {
@@ -131,6 +138,9 @@ class VehicleStatusService:
         if self._thread is not None:
             self._thread.join(timeout=self.probe_interval_seconds + 1.0)
             self._thread = None
+        # A driver's session closes its own port; this is the backstop for a
+        # shutdown that did not let it.
+        self.close_drive()
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -173,6 +183,68 @@ class VehicleStatusService:
             target_rpm=0,
             detail="All motors ramped down to 0 rpm",
         )
+
+    # -- Driving from /ws/status ----------------------------------------------
+    # Blocking, like everything else on the motor bus: the WebSocket route runs
+    # these in a worker thread.
+
+    def open_drive(self, owner: object) -> None:
+        """
+        Open the motor bus for `owner` and hold it until `close_drive`.
+
+        /motors/start opens the port per request and ramps; a driver sends a
+        command every 50 ms, so the port stays open for the whole session. One
+        driver at a time: a second one, or a ramp, is refused while it lasts.
+        The owner is what `drive` and `close_drive` check, so a session that
+        has ended can never command, or close, the bus of the one after it.
+        """
+        if not self.motor_device:
+            self._set_motor_component(connected=False, detail="DEVICE is not configured")
+            raise RuntimeError("Motor device is not configured")
+
+        with self._motor_bus_lock:
+            if self._drive_motor is not None:
+                raise RuntimeError("Another viewer is driving")
+            try:
+                self._drive_motor = self._motor_factory(device=self.motor_device)
+                self._drive_owner = owner
+            except (RuntimeError, SerialException, ValueError) as exc:
+                self._set_motor_component(connected=False, detail=str(exc))
+                raise RuntimeError(str(exc)) from exc
+
+        self._set_motor_component(connected=True, detail=DRIVER_HOLDS_BUS)
+
+    def drive(self, owner: object, left_rpm: int, right_rpm: int) -> None:
+        """
+        One command to each side. A no-op unless `owner` holds the bus: a
+        command that was waiting while the session closed is stale.
+        """
+        with self._drive_lock:
+            if self._drive_motor is None or self._drive_owner is not owner:
+                return
+            try:
+                self._send_side_rpms(self._drive_motor, left_rpm, right_rpm)
+            except (SerialException, OSError) as exc:
+                raise RuntimeError(str(exc)) from exc
+
+    def close_drive(self, owner: object | None = None) -> None:
+        """
+        Stop the motors and release the port, if `owner` holds it - or
+        whoever does, with no owner. Safe to call when no one is driving, and
+        more than once.
+        """
+        with self._motor_bus_lock, self._drive_lock:
+            if self._drive_motor is None:
+                return
+            if owner is not None and owner is not self._drive_owner:
+                return
+            motor, self._drive_motor, self._drive_owner = self._drive_motor, None, None
+            try:
+                self._send_side_rpms(motor, 0, 0)
+            finally:
+                motor.close()
+                with self._lock:
+                    self._current_command_rpm = 0
 
     def _probe_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -225,6 +297,15 @@ class VehicleStatusService:
             )
 
         with self._motor_bus_lock:
+            if self._drive_motor is not None:
+                # Commands are reaching the motors, which is all this probe
+                # would find out by opening the port a second time.
+                return ComponentSnapshot(
+                    configured=True,
+                    connected=True,
+                    detail=DRIVER_HOLDS_BUS,
+                    checked_at=checked_at,
+                )
             motor = None
             try:
                 motor = self._motor_factory(device=self.motor_device)
@@ -360,6 +441,8 @@ class VehicleStatusService:
             raise RuntimeError("Motor device is not configured")
 
         with self._motor_bus_lock:
+            if self._drive_motor is not None:
+                raise RuntimeError("Motors are being driven from the status page")
             motor = None
             try:
                 motor = self._motor_factory(device=self.motor_device)
@@ -383,17 +466,22 @@ class VehicleStatusService:
         )
 
     def _send_motor_commands(self, motor: DDS115, base_rpm: int) -> None:
-        for motor_id in LEFT_SIDE:
-            motor.send_rpm(motor_id, rpm=base_rpm)
-        for motor_id in RIGHT_SIDE:
-            motor.send_rpm(motor_id, rpm=base_rpm * (-1))
-
+        self._send_side_rpms(motor, base_rpm, base_rpm)
         with self._lock:
             self._current_command_rpm = base_rpm
+
+    def _send_side_rpms(self, motor: DDS115, left_rpm: int, right_rpm: int) -> None:
+        """Right-side motors are negated to match their mounting direction."""
+        for motor_id in LEFT_SIDE:
+            motor.send_rpm(motor_id, rpm=left_rpm)
+        for motor_id in RIGHT_SIDE:
+            motor.send_rpm(motor_id, rpm=right_rpm * (-1))
+
+        with self._lock:
             self._motor_feedback = [
                 {
                     "motor_id": motor_id,
-                    "rpm": base_rpm if motor_id in LEFT_SIDE else base_rpm * (-1),
+                    "rpm": left_rpm if motor_id in LEFT_SIDE else right_rpm * (-1),
                     "current_raw": None,
                 }
                 for motor_id in LEFT_SIDE + RIGHT_SIDE

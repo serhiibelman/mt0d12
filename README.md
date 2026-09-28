@@ -51,12 +51,23 @@ Open `http://<vehicle-host>:8000/` in a browser for the status page: battery, at
 components and Pi health, live over `/ws/status`. It needs nothing but the Pi, so it works
 on a network without internet.
 
+The page drives the rover too. Press **Arm**, then drag the on-screen stick (up is forward,
+left/right steers) or hold W A S D / the arrow keys; **Stop** or Space stops at once and
+disarms. Throttle ramps and steering mixes exactly as with the gamepad. While armed the page
+sends a command every 50 ms; half a second without one - Wi-Fi drop, sleeping laptop,
+hidden tab - stops the motors, and the page must be armed again. One driver at a time:
+a second tab is refused, and `/motors/start` answers 503 while someone drives.
+Why it is built this way: [docs/drive-over-websocket.md](docs/drive-over-websocket.md).
+
 Available endpoints:
 
 1. `GET /health` - API and hardware probe health.
    `GET /` serves the status page.
 2. `GET /status` - current vehicle snapshot, including configured motor IDs, hardware probe status, battery, attitude and Raspberry Pi health.
    `WS /ws/status` streams the same snapshot, pushed 5 times a second, for a live view without polling.
+   It also takes drive commands back: `{"type": "arm"}`, then
+   `{"type": "drive", "throttle": -1..1, "steer": -1..1}` at 20 Hz, and `{"type": "stop"}`.
+   Replies to those are `{"type": "drive", "armed": bool, "detail": str}`; status messages have no `type`.
 3. `POST /motors/start` - ramp all motors to a requested base RPM.
 4. `POST /motors/stop` - ramp all motors down to zero.
 5. `GET /camera/stream` - live MJPEG video from the RPi Camera (B).

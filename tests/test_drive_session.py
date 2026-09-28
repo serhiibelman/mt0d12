@@ -1,7 +1,11 @@
 import asyncio
 import threading
 
+import json
+import time
+
 from apps.api.services.drive import DriveSession, axis
+from apps.api.streaming import _read_commands
 
 
 class FakeBus:
@@ -194,3 +198,35 @@ def test_close_releases_a_port_that_finished_opening_after_the_arm_was_cancelled
         assert bus.closes == 1
 
     asyncio.run(main())
+
+
+class QueueSocket:
+    """Just enough WebSocket for `_read_commands`: receive from a queue."""
+
+    def __init__(self) -> None:
+        self.inbox: asyncio.Queue[dict] = asyncio.Queue()
+
+    async def receive(self) -> dict:
+        return await self.inbox.get()
+
+    def put(self, command: dict) -> None:
+        self.inbox.put_nowait({"type": "websocket.receive", "text": json.dumps(command)})
+
+
+def test_a_stalled_event_loop_is_not_taken_for_a_lost_link() -> None:
+    async def scenario(session, bus, notes):
+        socket = QueueSocket()
+        await session.arm()
+        reader = asyncio.create_task(_read_commands(socket, session, 0.05))
+        await asyncio.sleep(0)
+        # A command that arrives while the loop is blocked comes due in the
+        # same pass as the link timeout, and after it - as when the camera
+        # opening holds the Pi's only core.
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.1, socket.put, {"type": "drive", "throttle": 0.5, "steer": 0})
+        time.sleep(0.2)
+        await asyncio.sleep(0.02)
+        reader.cancel()
+        assert session.armed, notes
+
+    run_session(scenario)

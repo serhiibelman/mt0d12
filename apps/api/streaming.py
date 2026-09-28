@@ -23,6 +23,9 @@ from apps.api.services.drive import DriveSession, axis
 # same value in the Content-Type header.
 MJPEG_BOUNDARY = "FRAME"
 
+# How long a timed-out command read looks for a command that was already there.
+STALL_GRACE = 0.05
+
 
 def locked_sender(websocket: WebSocket) -> Callable[[str], Awaitable[None]]:
     """`send_text`, one message at a time.
@@ -85,11 +88,29 @@ async def _read_commands(websocket: WebSocket, session: DriveSession, link_timeo
             async with asyncio.timeout(link_timeout if session.armed else None):
                 message = await websocket.receive()
         except TimeoutError:
-            await session.disarm(f"No command for {link_timeout:g}s - stopped")
-            continue
+            message = await _already_arrived(websocket)
+            if message is None:
+                await session.disarm(f"No command for {link_timeout:g}s - stopped")
+                continue
         if message["type"] == "websocket.disconnect":
             raise ViewerLeft
         await _handle_command(session, _parse(message))
+
+
+async def _already_arrived(websocket: WebSocket) -> dict[str, Any] | None:
+    """A command that came in while this process was too busy to read it.
+
+    When the event loop stalls - the camera opening takes the Pi 1's only core
+    for a second or more - the timeout and the commands queued behind it come
+    due together, and the timeout can win although the link is fine. A
+    message already waiting is returned at once; only a real silence costs
+    `STALL_GRACE` on top of the link timeout.
+    """
+    try:
+        async with asyncio.timeout(STALL_GRACE):
+            return await websocket.receive()
+    except TimeoutError:
+        return None
 
 
 def _parse(message: dict[str, Any]) -> dict[str, Any] | None:

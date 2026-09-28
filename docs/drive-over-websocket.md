@@ -70,7 +70,7 @@ Where the code lives:
 | Stop at once, not ramped | A ramp down from 200 rpm is seconds of driving blind. Same as `VehicleController._fail_safe`. | Ramping down on a link drop. |
 | Port held open per session | 20 commands a second cannot reopen the serial port each time, as `/motors/start` does. | Opening per command. |
 | One driver, owner-checked | Two tabs would alternate commands. The owner check means an ended session can never command or close the next one's bus. | Last writer wins; a close with no owner check. |
-| Bus calls in `asyncio.to_thread` | The serial writes block, and the event loop also serves status and every other request. | `pyserial-asyncio`: kept for backlog item 1 (the UDP loop), where it is the lesson. |
+| Bus calls in `asyncio.to_thread` | The serial writes block, and the event loop also serves status and every other request. | `pyserial-asyncio`: weighed again for the UDP loop and passed over there too; see [udp-loop-asyncio.md](udp-loop-asyncio.md). |
 | Drive replies carry `type`, status does not | The page tells them apart without changing the schema `/status` and telemetry share. | A drive field in the status snapshot. |
 | Per-socket send lock | Status and drive replies go out from different tasks; two interleaved frames would be one corrupt message. | Relying on one frame being one write today. |
 | Mixing shared with `VehicleController` | The stick should feel the same on the page and the gamepad; `_compute_side_rpms` became static for it. | A second copy of the ramp and mix. |

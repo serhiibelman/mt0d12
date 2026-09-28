@@ -1,8 +1,9 @@
-import time
-from typing import Callable, Optional
+import asyncio
+import threading
+from typing import Any, Callable, Optional
 
 from lib.common.formatting import print_info, print_warning
-from lib.gamepad.udp_receiver import UDPReceiver
+from lib.gamepad.udp_receiver import ControllerStateProtocol
 from lib.gamepad.state import ControllerState
 from lib.ddsm115 import DDS115
 from settings import RIGHT_SIDE, LEFT_SIDE
@@ -11,14 +12,23 @@ MAX_RPM = 200
 MAX_STEER_RPM = 100  # half of MAX_RPM for gentler turns
 RAMP_STEP = 5
 DEAD_ZONE = 0.1  # ignore axis jitter near center
-LOOP_INTERVAL = 0.05  # 20 Hz
+# The /motors/start ramp's step. The control loop no longer ticks: it acts on
+# each packet as it lands, and the controller sends at 20 Hz.
+LOOP_INTERVAL = 0.05
 # The controller sends at 20 Hz whether or not the sticks move, so this much
 # silence is ~10 lost packets in a row: the link is gone, not just lossy.
 LINK_TIMEOUT = 0.5
 
 
 class VehicleController:
-    """Controls vehicle motors based on gamepad input received over UDP.
+    """
+    Controls vehicle motors based on gamepad input received over UDP.
+
+    Runs on asyncio: `run` waits on the UDP protocol instead of polling the
+    socket on a timer. The motor bus blocks - each `send_rpm` waits for the
+    motor's reply, up to 100 ms for one that does not answer - so every pass
+    over the motors runs in a worker thread, and the event loop never stalls
+    on the serial port.
 
     Control scheme:
         - Press 'a' to toggle drive mode on/off.
@@ -33,64 +43,60 @@ class VehicleController:
         RIGHT_SIDE motors receive rpm * -1 to match the physical mounting direction.
     """
 
-    def __init__(
-        self,
-        receiver: UDPReceiver,
-        motor: DDS115,
-        link_timeout: float = LINK_TIMEOUT,
-        time_func: Callable[[], float] = time.monotonic,
-    ):
-        self.receiver = receiver
+    def __init__(self, motor: DDS115, link_timeout: float = LINK_TIMEOUT):
         self.motor = motor
         self.link_timeout = link_timeout
-        self._now = time_func
         self._current_rpm: float = 0.0
         self._braked: bool = False
         self._drive_enabled: bool = False
         self._prev_a: bool = False  # for edge detection on 'a' toggle
-        # Arrival time on this clock, not the packet's `timestamp`: that one is
-        # stamped by the laptop, whose clock need not agree with the Pi's.
-        self._last_packet_at: Optional[float] = None
         self._link_lost: bool = False
+        # One pass over the motors at a time. A worker thread cannot be
+        # cancelled, so on shutdown the final stop waits here for a pass still
+        # on the bus rather than writing over it.
+        self._bus_lock = threading.Lock()
 
-    def run(self):
-        """Start the main control loop. Blocks until KeyboardInterrupt."""
+    async def run(self, packets: ControllerStateProtocol) -> None:
+        """Act on packets as they arrive until cancelled, then stop the motors."""
         print_info("VehicleController started")
         try:
             while True:
-                self.tick()
-                time.sleep(LOOP_INTERVAL)
-        except KeyboardInterrupt:
-            print_info("VehicleController stopped")
+                try:
+                    async with asyncio.timeout_at(self._link_deadline(packets)):
+                        state = await packets.next_state()
+                except TimeoutError:
+                    await self._on_bus(self._fail_safe)
+                    continue
+                if self._link_lost:
+                    self._link_lost = False
+                    print_info("Control link restored - press 'a' to drive")
+                # Packets that land while this pass is on the bus are not
+                # queued: the protocol keeps the newest, which is taken next.
+                await self._on_bus(self._handle, state)
         finally:
-            self._stop_motors()
+            await self._on_bus(self._stop_motors)
 
-    def tick(self) -> None:
-        """One loop iteration: act on the newest packet, or fail safe on silence."""
-        state = self._receive_latest()
-        if state is not None:
-            self._last_packet_at = self._now()
-            if self._link_lost:
-                self._link_lost = False
-                print_info("Control link restored - press 'a' to drive")
-            self._handle(state)
-        elif self._link_timed_out():
-            self._fail_safe()
+    def _link_deadline(self, packets: ControllerStateProtocol) -> Optional[float]:
+        """When silence becomes a lost link, in loop time; None for no limit.
 
-    def _receive_latest(self) -> Optional[ControllerState]:
+        Counted from the last packet's arrival, not from when the wait began,
+        so time spent on the bus counts as silence too. No limit before the
+        first packet - until a controller has spoken the motors have not been
+        commanded, so there is nothing to stop - or once the link is already
+        lost, so the stop is sent once per outage.
         """
-        Drain the UDP buffer and return only the most recent state.
+        if self._link_lost or packets.last_arrival is None:
+            return None
+        return packets.last_arrival + self.link_timeout
 
-        send_rpm() blocks per motor, so packets pile up between iterations.
-        Without draining, we always act on stale data.
-        """
-        latest = None
-        while True:
-            pkt = self.receiver.receive()
-            if pkt is None:
-                break
-            latest = pkt
-        return latest
+    async def _on_bus(self, action: Callable[..., None], *args: Any) -> None:
+        """Run `action` in a worker thread, holding the bus."""
+
+        def locked() -> None:
+            with self._bus_lock:
+                action(*args)
+
+        await asyncio.to_thread(locked)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -133,16 +139,6 @@ class VehicleController:
             right_rpm = self._current_rpm
 
         self._apply(left_rpm, right_rpm)
-
-    def _link_timed_out(self) -> bool:
-        """True once packets stop for longer than link_timeout.
-
-        Never true before the first packet: until a controller has spoken the
-        motors have not been commanded, so there is nothing to stop.
-        """
-        if self._link_lost or self._last_packet_at is None:
-            return False
-        return self._now() - self._last_packet_at > self.link_timeout
 
     def _fail_safe(self) -> None:
         """Stop the motors and disarm once the control link has gone quiet.

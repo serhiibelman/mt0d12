@@ -172,10 +172,12 @@ Notes:
    battery - so those become `null`.
 2. Any field can be `null`: when the flight controller is not configured, not
    answering, or has no current sensor fitted.
-3. Readings are taken during the existing health probe, which reopens the link
-   every couple of seconds. `SYS_STATUS` streams more slowly than that, so a
-   probe that catches none keeps the previous reading rather than blanking it.
-   Everything is dropped as soon as the link stops answering.
+3. The link stays open and every `ATTITUDE` and `SYS_STATUS` is taken as it
+   arrives, so the 5 Hz status stream shows attitude at most 200 ms old. Three
+   seconds without a heartbeat, or a read that fails (a USB cable pulled out),
+   counts as a lost link: the readings go `null` at once and the link is
+   reopened with backoff, 0.5s doubling to 10s. `flight_controller.detail` says
+   why and when the next try is.
 4. `yaw_deg` travels in the payload but is not treated as a change, because a
    compass drifts on its own and a parked rover would otherwise publish every
    few seconds. `roll_deg` and `pitch_deg` are gravity-referenced and stay put,

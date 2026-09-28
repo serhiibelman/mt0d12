@@ -42,6 +42,7 @@ def create_app(
         # How long a driver may go without a command before the motors stop.
         app.state.drive_link_timeout = drive_link_timeout
         service.start()
+        await service.start_streams()
         telemetry.start()
         # The camera opens on the first stream/snapshot request instead of at
         # boot, so the sensor stays powered down while nobody is watching.
@@ -50,6 +51,7 @@ def create_app(
         finally:
             await broadcaster.stop()
             telemetry.stop()
+            await service.stop_streams()
             service.stop()
             camera.stop()
 

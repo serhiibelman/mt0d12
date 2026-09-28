@@ -1,3 +1,7 @@
+import asyncio
+import threading
+import time
+
 import pytest
 
 from apps.api.services.camera import CameraService
@@ -69,8 +73,7 @@ CAMERA = {
 def make_service(**kwargs) -> CameraService:
     return CameraService(
         backend_factory=FakeCameraBackend,
-        frame_timeout_seconds=0.2,
-        **{**CAMERA, **kwargs},
+        **{"frame_timeout_seconds": 0.2, "idle_stop_seconds": 0.05, **CAMERA, **kwargs},
     )
 
 
@@ -139,11 +142,40 @@ def test_next_frame_returns_the_latest_frame_and_drops_stale_ones() -> None:
 
     backend.push(b"first")
     backend.push(b"second")  # overwrites the frame nobody read yet
-    seq, frame = service.next_frame(-1)
+    seq, frame = asyncio.run(service.next_frame(-1))
     assert frame == b"second"
 
     backend.push(b"third")
-    assert service.next_frame(seq)[1] == b"third"
+    assert asyncio.run(service.next_frame(seq))[1] == b"third"
+
+
+def test_a_frame_from_the_capture_thread_wakes_a_waiting_viewer() -> None:
+    service = make_service(frame_timeout_seconds=2.0)
+    service.acquire_client_slot()
+    backend = FakeCameraBackend.instances[0]
+
+    async def main():
+        waiting = asyncio.create_task(service.next_frame(-1))
+        await asyncio.sleep(0.05)
+        assert not waiting.done(), "must wait while there is no frame yet"
+        # The real backend publishes from picamera2's own thread.
+        threading.Thread(target=backend.push, args=(b"fresh",)).start()
+        return await waiting
+
+    assert asyncio.run(main())[1] == b"fresh"
+
+
+def test_stop_ends_a_waiting_viewer() -> None:
+    service = make_service(frame_timeout_seconds=2.0)
+    service.acquire_client_slot()
+
+    async def main():
+        waiting = asyncio.create_task(service.next_frame(-1))
+        await asyncio.sleep(0.05)
+        await asyncio.to_thread(service.stop)
+        return await waiting
+
+    assert asyncio.run(main()) is None
 
 
 def test_next_frame_times_out_and_marks_the_camera_disconnected() -> None:
@@ -151,7 +183,7 @@ def test_next_frame_times_out_and_marks_the_camera_disconnected() -> None:
     service.start()
 
     with pytest.raises(RuntimeError, match="Timed out"):
-        service.next_frame(-1)
+        asyncio.run(service.next_frame(-1))
 
     component = service.snapshot()["component"]
     assert component["connected"] is False
@@ -177,7 +209,35 @@ def test_next_frame_returns_none_once_the_camera_is_stopped() -> None:
 
     service.stop()
 
-    assert service.next_frame(-1) is None
+    assert asyncio.run(service.next_frame(-1)) is None
+
+
+def test_camera_stops_once_the_last_viewer_leaves() -> None:
+    service = make_service()
+    service.acquire_client_slot()
+    service.acquire_client_slot()
+    backend = FakeCameraBackend.instances[0]
+
+    service.release_client_slot()
+    time.sleep(0.15)
+    assert backend.started is True, "a viewer is still watching"
+
+    service.release_client_slot()
+    time.sleep(0.15)
+    assert backend.started is False
+    assert service.snapshot()["running"] is False
+
+
+def test_a_viewer_returning_within_the_grace_period_keeps_the_camera() -> None:
+    service = make_service(idle_stop_seconds=0.1)
+    service.acquire_client_slot()
+    service.release_client_slot()
+
+    service.acquire_client_slot()
+    time.sleep(0.2)
+
+    assert len(FakeCameraBackend.instances) == 1
+    assert FakeCameraBackend.instances[0].started is True
 
 
 def test_capture_frame_waits_for_a_fresh_frame() -> None:

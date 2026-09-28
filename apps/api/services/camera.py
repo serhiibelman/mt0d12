@@ -196,6 +196,22 @@ class CameraService:
             checked_at=utc_now(),
         )
 
+    def preload(self) -> None:
+        """Import picamera2 now, so the first viewer does not pay for it.
+
+        On a Pi 1 the import (numpy, libcamera) takes several seconds of the
+        only core. Done on the first stream - the moment the page arms - it
+        starved the event loop long enough for the drive link to time out.
+        Blocking, so the app runs it in a thread at startup.
+        """
+        if not self.enabled:
+            return
+        try:
+            import picamera2  # noqa: F401
+        except BACKEND_ERRORS:
+            # The first real start reports it; this is only a head start.
+            pass
+
     def start(self) -> dict[str, Any]:
         self.ensure_running()
         return self._command_response(action="start", detail="Camera capture is running")

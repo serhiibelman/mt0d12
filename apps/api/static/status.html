@@ -125,12 +125,15 @@
   th, td { padding: 5px 0; text-align: right; border-top: 1px solid var(--line); }
   th { color: var(--muted); font-weight: 400; border-top: 0; }
   th:first-child, td:first-child { text-align: left; }
-  .drive, .camera { grid-column: 1 / -1; }
+  .drive { grid-column: 1 / -1; }
+  /* The view sits beside the stick and buttons, sized so all of it fits on
+     one screen: never taller than half the window, wrapping above the
+     controls on a phone. */
   .screen {
     position: relative;
+    flex: 1 1 320px;
+    max-width: min(560px, calc(50vh * 4 / 3));
     aspect-ratio: 4 / 3;
-    max-height: 70vh;
-    margin: 0 auto;
     overflow: hidden;
     border-radius: 6px;
     background: #000;
@@ -227,19 +230,15 @@
 </header>
 
 <main>
-  <section class="camera">
-    <h2>Camera</h2>
-    <div class="screen" id="screen" data-state="off">
-      <div class="screen-message">
-        <strong id="screen-title">Camera off</strong>
-        <span id="screen-detail">Arm to start the video with the motors.</span>
-      </div>
-    </div>
-  </section>
-
   <section class="drive">
     <h2>Drive</h2>
     <div class="drive-body">
+      <div class="screen" id="screen" data-state="off">
+        <div class="screen-message">
+          <strong id="screen-title">Camera off</strong>
+          <span id="screen-detail">Arm to start the video with the motors.</span>
+        </div>
+      </div>
       <div class="pad" id="pad" data-armed="false" aria-label="Joystick: up and down drive, left and right steer">
         <div class="knob" id="knob"></div>
       </div>
@@ -254,7 +253,7 @@
           <button id="arm">Arm</button>
           <button class="stop" id="stop" disabled>Stop</button>
         </div>
-        <div class="hint">Keys: W A S D or arrows to drive, Space to stop.</div>
+        <div class="hint">Keys: W A S D or arrows to drive at 25%, Space to stop.</div>
       </div>
     </div>
   </section>
@@ -467,10 +466,14 @@ function send(message) {
   return false;
 }
 
+// A key is all or nothing, so it gives a gentle fixed speed; the pad is
+// where full speed lives.
+const KEY_SPEED = 0.25;
+
 function stick() {
   if (padStick.held) return { throttle: padStick.y, steer: padStick.x };
-  const throttle = (keys.has("up") ? 1 : 0) - (keys.has("down") ? 1 : 0);
-  const steer = (keys.has("right") ? 1 : 0) - (keys.has("left") ? 1 : 0);
+  const throttle = KEY_SPEED * ((keys.has("up") ? 1 : 0) - (keys.has("down") ? 1 : 0));
+  const steer = KEY_SPEED * ((keys.has("right") ? 1 : 0) - (keys.has("left") ? 1 : 0));
   return { throttle, steer };
 }
 

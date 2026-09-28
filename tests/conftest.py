@@ -149,6 +149,9 @@ class FakeCameraService:
         self.stop_calls += 1
         return self._command("stop", "Camera capture stopped", running=False)
 
+    def preload(self) -> None:
+        pass
+
     def acquire_client_slot(self) -> None:
         self._guard()
         self.slots += 1

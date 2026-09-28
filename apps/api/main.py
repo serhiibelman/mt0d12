@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -45,10 +46,13 @@ def create_app(
         await service.start_streams()
         await telemetry.start()
         # The camera opens on the first stream/snapshot request instead of at
-        # boot, so the sensor stays powered down while nobody is watching.
+        # boot, so the sensor stays powered down while nobody is watching. Its
+        # library loads now, in the background, as that is the slow part.
+        preload = asyncio.create_task(asyncio.to_thread(camera.preload))
         try:
             yield
         finally:
+            await preload
             await broadcaster.stop()
             await telemetry.stop()
             await service.stop_streams()

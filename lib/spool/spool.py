@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock
 from typing import Callable, Sequence
+
+import aiosqlite
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +37,17 @@ class SpooledMessage:
 
 
 class Spool:
-    """A durable FIFO queue of MQTT messages, backed by one SQLite file.
+    """
+    A durable FIFO queue of MQTT messages, backed by one SQLite file.
 
-    SQLite is in the standard library, needs no daemon, and commits
-    transactionally - so a message that was accepted here is still here after
-    the battery is pulled mid-drive, which is exactly when the uplink is down
-    and the samples matter most.
+    SQLite needs no daemon and commits transactionally - so a message that was
+    accepted here is still here after the battery is pulled mid-drive, which is
+    exactly when the uplink is down and the samples matter most.
+
+    Async, through aiosqlite: every statement runs on the connection's own
+    worker thread, so an fsync on a slow SD card never stalls the event loop
+    the rest of the API runs on. The file format is unchanged from the
+    threaded version, so an existing spool carries over.
 
     Delivered rows are deleted rather than flagged `sent`. A delivered message
     is already durable in Postgres, and the failure this guards against is a
@@ -61,34 +67,35 @@ class Spool:
         self.max_rows = max_rows
         self.max_age_seconds = max_age_seconds
         self._now = time_func
-        self._lock = Lock()
-        self._connection: sqlite3.Connection | None = None
+        # Each method below is several statements and a commit; interleaved
+        # with another's, one commit would take the other's half-done work.
+        self._lock = asyncio.Lock()
+        self._connection: aiosqlite.Connection | None = None
         self.dropped = 0
 
     # -- lifecycle ---------------------------------------------------------
 
-    def _connect(self) -> sqlite3.Connection:
+    async def _connect(self) -> aiosqlite.Connection:
         """Opened on first use so constructing a publisher touches no disk."""
         if self._connection is not None:
             return self._connection
         if self.path not in (":memory:", ""):
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        # The publisher thread writes and the API thread may flush; one
-        # connection guarded by our own lock is simpler than one per thread.
-        connection = sqlite3.connect(self.path, check_same_thread=False)
-        connection.row_factory = sqlite3.Row
+        connection = await aiosqlite.connect(self.path)
+        connection.row_factory = aiosqlite.Row
         # WAL survives a crash mid-write; synchronous=FULL means a commit has
         # reached the card before we call the message ours. At one message
         # every few seconds the extra fsync costs nothing worth counting.
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=FULL")
-        self._apply_schema(connection)
+        await connection.execute("PRAGMA journal_mode=WAL")
+        await connection.execute("PRAGMA synchronous=FULL")
+        await self._apply_schema(connection)
         self._connection = connection
         return connection
 
     @staticmethod
-    def _apply_schema(connection: sqlite3.Connection) -> None:
-        """Create the table, discarding a spool written by another version.
+    async def _apply_schema(connection: aiosqlite.Connection) -> None:
+        """
+        Create the table, discarding a spool written by another version.
 
         `CREATE TABLE IF NOT EXISTS` silently keeps an older table, so a
         changed schema would only surface as a failing INSERT on a rover that
@@ -101,7 +108,8 @@ class Spool:
         history. Anything that has to survive a schema change does not belong
         in it.
         """
-        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        async with connection.execute("PRAGMA user_version") as cursor:
+            version = int((await cursor.fetchone())[0])
         if version != SCHEMA_VERSION:
             if version != 0:
                 logger.warning(
@@ -109,45 +117,50 @@ class Spool:
                     version,
                     SCHEMA_VERSION,
                 )
-            connection.execute("DROP TABLE IF EXISTS outbox")
+            await connection.execute("DROP TABLE IF EXISTS outbox")
         # `executescript` commits whatever is open, so this is not one
         # transaction. It does not need to be: the version is stamped last, so
         # a crash part-way leaves the old version and the next open repeats
         # the whole thing.
-        connection.executescript(SCHEMA)
+        await connection.executescript(SCHEMA)
         # No placeholders in a PRAGMA; the value is our own constant.
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION:d}")
-        connection.commit()
+        await connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION:d}")
+        await connection.commit()
 
-    def close(self) -> None:
-        with self._lock:
+    async def close(self) -> None:
+        async with self._lock:
             if self._connection is None:
                 return
-            self._connection.close()
+            await self._connection.close()
             self._connection = None
 
-    # -- queue -------------------------------------------------------------
+    # -- queue ---------------------------------------------------------------
 
-    def append(self, topic: str, payload: str) -> int:
+    async def append(self, topic: str, payload: str) -> int:
         """Store one message and return its id. Trims to the retention cap."""
-        with self._lock:
-            connection = self._connect()
-            with connection:
-                cursor = connection.execute(
+        async with self._lock:
+            connection = await self._connect()
+            try:
+                cursor = await connection.execute(
                     "INSERT INTO outbox (queued_at, topic, payload) VALUES (?, ?, ?)",
                     (self._now(), topic, payload),
                 )
-                self._trim(connection)
+                await self._trim(connection)
+                await connection.commit()
+            except BaseException:
+                await connection.rollback()
+                raise
             return int(cursor.lastrowid)
 
-    def pending(self, limit: int) -> list[SpooledMessage]:
+    async def pending(self, limit: int) -> list[SpooledMessage]:
         """The oldest `limit` messages. Order is the order they were queued."""
-        with self._lock:
-            connection = self._connect()
-            rows = connection.execute(
+        async with self._lock:
+            connection = await self._connect()
+            async with connection.execute(
                 "SELECT id, queued_at, topic, payload FROM outbox ORDER BY id LIMIT ?",
                 (limit,),
-            ).fetchall()
+            ) as cursor:
+                rows = await cursor.fetchall()
         return [
             SpooledMessage(
                 id=row["id"],
@@ -158,24 +171,29 @@ class Spool:
             for row in rows
         ]
 
-    def discard(self, ids: Sequence[int]) -> None:
+    async def discard(self, ids: Sequence[int]) -> None:
         """Forget messages the broker has acknowledged."""
         if not ids:
             return
-        with self._lock:
-            connection = self._connect()
-            with connection:
-                connection.executemany("DELETE FROM outbox WHERE id = ?", [(i,) for i in ids])
+        async with self._lock:
+            connection = await self._connect()
+            try:
+                await connection.executemany("DELETE FROM outbox WHERE id = ?", [(i,) for i in ids])
+                await connection.commit()
+            except BaseException:
+                await connection.rollback()
+                raise
 
-    def depth(self) -> int:
+    async def depth(self) -> int:
         """How many messages are still waiting."""
-        with self._lock:
-            connection = self._connect()
-            return int(connection.execute("SELECT COUNT(*) FROM outbox").fetchone()[0])
+        async with self._lock:
+            connection = await self._connect()
+            async with connection.execute("SELECT COUNT(*) FROM outbox") as cursor:
+                return int((await cursor.fetchone())[0])
 
-    # -- retention ---------------------------------------------------------
+    # -- retention -------------------------------------------------------------
 
-    def _trim(self, connection: sqlite3.Connection) -> None:
+    async def _trim(self, connection: aiosqlite.Connection) -> None:
         """Drop the oldest messages once the spool is too old or too long.
 
         Newest-wins: during a long outage the recent samples are the ones that
@@ -184,15 +202,15 @@ class Spool:
         dropped = 0
         if self.max_age_seconds > 0:
             cutoff = self._now() - self.max_age_seconds
-            dropped += connection.execute(
-                "DELETE FROM outbox WHERE queued_at < ?", (cutoff,)
-            ).rowcount
+            cursor = await connection.execute("DELETE FROM outbox WHERE queued_at < ?", (cutoff,))
+            dropped += cursor.rowcount
         if self.max_rows > 0:
-            dropped += connection.execute(
+            cursor = await connection.execute(
                 "DELETE FROM outbox WHERE id NOT IN "
                 "(SELECT id FROM outbox ORDER BY id DESC LIMIT ?)",
                 (self.max_rows,),
-            ).rowcount
+            )
+            dropped += cursor.rowcount
         if dropped > 0:
             self.dropped += dropped
             logger.warning(

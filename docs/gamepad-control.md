@@ -19,8 +19,11 @@ Run on the Raspberry Pi:
 That starts `python -m apps.vehicle_control.main`, which:
 
 1. Opens the DDS115 motor bus.
-2. Starts a UDP receiver on port `5005`.
-3. Converts incoming gamepad state into left/right motor RPM commands.
+2. Starts a UDP receiver on port `5005` - an asyncio `DatagramProtocol`, so each
+   packet is handled as it lands rather than on a 20 Hz poll.
+3. Converts incoming gamepad state into left/right motor RPM commands. The
+   motor writes run in a worker thread, so a slow or silent motor never stalls
+   the event loop; packets that land meanwhile collapse to the newest one.
 
 ### Controller side
 

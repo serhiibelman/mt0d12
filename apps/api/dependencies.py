@@ -29,6 +29,11 @@ def get_status_broadcaster(connection: HTTPConnection) -> StatusBroadcaster:
     return connection.app.state.status_broadcaster
 
 
+def get_drive_link_timeout(connection: HTTPConnection) -> float:
+    return connection.app.state.drive_link_timeout
+
+
 VehicleStatusServiceDep = Annotated[VehicleStatusService, Depends(get_vehicle_status_service)]
 CameraServiceDep = Annotated[CameraService, Depends(get_camera_service)]
 StatusBroadcasterDep = Annotated[StatusBroadcaster, Depends(get_status_broadcaster)]
+DriveLinkTimeoutDep = Annotated[float, Depends(get_drive_link_timeout)]

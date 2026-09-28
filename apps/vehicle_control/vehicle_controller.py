@@ -161,7 +161,8 @@ class VehicleController:
         self._current_rpm = 0.0
         self._stop_motors()
 
-    def _compute_side_rpms(self, base_rpm: float, right_x: float) -> tuple[float, float]:
+    @staticmethod
+    def _compute_side_rpms(base_rpm: float, right_x: float) -> tuple[float, float]:
         """
         Return (left_rpm, right_rpm) by blending base speed with steering input.
 

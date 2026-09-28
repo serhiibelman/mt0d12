@@ -1,3 +1,5 @@
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -184,3 +186,122 @@ def test_two_viewers_watch_at_once(build_app, vehicle_service) -> None:
         for ws in (first, second):
             while ws.receive_json()["battery"]["voltage_v"] != 11.9:
                 pass
+
+
+# -- driving over /ws/status -------------------------------------------------
+
+
+def next_drive_state(ws) -> dict:
+    """The next drive-state message, skipping the status updates between."""
+    while True:
+        message = ws.receive_json()
+        if message.get("type") == "drive":
+            return message
+
+
+def wait_for(condition, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.005)
+
+
+def test_arming_and_driving_moves_the_motors(build_app, vehicle_service) -> None:
+    with TestClient(build_app()) as client, client.websocket_connect("/ws/status") as ws:
+        ws.send_json({"type": "arm"})
+        assert next_drive_state(ws) == {"type": "drive", "armed": True, "detail": "Driving"}
+        ws.send_json({"type": "drive", "throttle": 1.0, "steer": 0.0})
+        wait_for(lambda: vehicle_service.drive_commands)
+        # Status keeps coming while driving.
+        assert "battery" in ws.receive_json()
+
+    assert vehicle_service.drive_commands[0] == (5, 5)
+
+
+def test_drive_commands_without_arming_are_ignored(build_app, vehicle_service) -> None:
+    with TestClient(build_app()) as client, client.websocket_connect("/ws/status") as ws:
+        ws.send_json({"type": "drive", "throttle": 1.0, "steer": 0.0})
+        ws.receive_json()
+        ws.receive_json()
+
+    assert vehicle_service.drive_commands == []
+    assert vehicle_service.drive_owner is None
+
+
+def test_malformed_commands_do_not_break_the_stream(build_app, vehicle_service) -> None:
+    with TestClient(build_app()) as client, client.websocket_connect("/ws/status") as ws:
+        ws.send_json({"type": "arm"})
+        next_drive_state(ws)
+        for junk in ("[1, 2]", '{"type": "drive", "throttle": "fast", "steer": 0}', "{"):
+            ws.send_text(junk)
+        ws.send_bytes(b"\x00")
+        ws.send_json({"type": "drive", "throttle": 0.0, "steer": 0.5})
+        wait_for(lambda: vehicle_service.drive_commands)
+
+    assert vehicle_service.drive_commands == [(50, -50)]
+
+
+def test_stop_disarms_and_releases_the_bus(build_app, vehicle_service) -> None:
+    with TestClient(build_app()) as client, client.websocket_connect("/ws/status") as ws:
+        ws.send_json({"type": "arm"})
+        next_drive_state(ws)
+        ws.send_json({"type": "stop"})
+        assert next_drive_state(ws) == {"type": "drive", "armed": False, "detail": "Stopped"}
+        assert vehicle_service.drive_owner is None
+
+
+def test_leaving_while_driving_stops_the_motors(build_app, vehicle_service) -> None:
+    with TestClient(build_app()) as client:
+        with client.websocket_connect("/ws/status") as ws:
+            ws.send_json({"type": "arm"})
+            next_drive_state(ws)
+            ws.send_json({"type": "drive", "throttle": 1.0, "steer": 0.0})
+            wait_for(lambda: vehicle_service.drive_commands)
+        wait_for(lambda: vehicle_service.drive_owner is None)
+
+    assert vehicle_service.drive_closes == 1
+
+
+def test_a_silent_driver_is_stopped(build_app, vehicle_service) -> None:
+    app = build_app(drive_link_timeout=0.05)
+    with TestClient(app) as client, client.websocket_connect("/ws/status") as ws:
+        ws.send_json({"type": "arm"})
+        next_drive_state(ws)
+        # ... and then nothing, as from a laptop that went to sleep.
+        state = next_drive_state(ws)
+        assert state["armed"] is False
+        assert "No command for 0.05s" in state["detail"]
+        assert vehicle_service.drive_owner is None
+        # Commands after the link comes back move nothing until armed again.
+        ws.send_json({"type": "drive", "throttle": 1.0, "steer": 0.0})
+        ws.receive_json()
+        ws.receive_json()
+        assert vehicle_service.drive_commands == []
+
+
+def test_a_watcher_is_never_timed_out(build_app, vehicle_service) -> None:
+    app = build_app(drive_link_timeout=0.01)
+    with TestClient(app) as client, client.websocket_connect("/ws/status") as ws:
+        for _ in range(10):
+            assert "type" not in ws.receive_json()
+
+
+def test_a_second_driver_is_refused(build_app, vehicle_service) -> None:
+    with (
+        TestClient(build_app()) as client,
+        client.websocket_connect("/ws/status") as first,
+        client.websocket_connect("/ws/status") as second,
+    ):
+        first.send_json({"type": "arm"})
+        assert next_drive_state(first)["armed"] is True
+        second.send_json({"type": "arm"})
+        assert next_drive_state(second) == {
+            "type": "drive",
+            "armed": False,
+            "detail": "Another viewer is driving",
+        }
+        # The second viewer leaving must not stop the first one's motors.
+        second.close()
+        first.send_json({"type": "drive", "throttle": 1.0, "steer": 0.0})
+        wait_for(lambda: vehicle_service.drive_commands)
+        assert vehicle_service.drive_closes == 0

@@ -3,54 +3,122 @@
 A route decides what to stream; the functions here do the sending and notice
 the viewer going away, so the route itself stays a few lines long.
 
-- `forward_until_disconnect`: WebSocket, messages from a queue (/ws/status).
+- `serve_until_disconnect`: WebSocket, status from a queue out and drive
+  commands in (/ws/status).
 - `mjpeg_parts`: HTTP multipart, JPEG frames from the camera (/camera/stream).
 """
 
 import asyncio
-from collections.abc import AsyncIterator
+import json
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any
 
 from fastapi import Request, WebSocket
 from fastapi.concurrency import run_in_threadpool
 
 from apps.api.exceptions import ViewerLeft
 from apps.api.services.camera import CameraService
+from apps.api.services.drive import DriveSession, axis
 
 # Separates the JPEGs in a multipart/x-mixed-replace body; the route puts the
 # same value in the Content-Type header.
 MJPEG_BOUNDARY = "FRAME"
 
 
-async def forward_until_disconnect(websocket: WebSocket, updates: asyncio.Queue[str]) -> None:
-    """Send every message from `updates` to the viewer until they disconnect.
+def locked_sender(websocket: WebSocket) -> Callable[[str], Awaitable[None]]:
+    """`send_text`, one message at a time.
 
-    Two things wait at once - the next update, and the viewer's disconnect - so
-    each gets a task, under a TaskGroup: when either ends with an exception the
-    group cancels the other. The disconnect ends it quietly; anything else, such
-    as a send that failed for a real reason, propagates.
+    Status and drive state go out from different tasks. One frame is one write
+    today, but nothing promises that, and two frames interleaved would be one
+    corrupt message; the lock makes it not matter.
+    """
+    lock = asyncio.Lock()
+
+    async def send(text: str) -> None:
+        async with lock:
+            await websocket.send_text(text)
+
+    return send
+
+
+async def serve_until_disconnect(
+    websocket: WebSocket,
+    send: Callable[[str], Awaitable[None]],
+    updates: asyncio.Queue[str],
+    session: DriveSession,
+    link_timeout: float,
+) -> None:
+    """Status out, drive commands in, until the viewer disconnects.
+
+    Three things wait at once - the next update, the next command and a free
+    motor bus - so each gets a task, under a TaskGroup: when any ends with an
+    exception the group cancels the others. The disconnect ends it quietly;
+    anything else, such as a send that failed for a real reason, propagates.
+    Either way the caller's `DriveSession.close` stops the motors after.
     """
     try:
         async with asyncio.TaskGroup() as tasks:
-            tasks.create_task(_forward(websocket, updates))
-            tasks.create_task(_listen_until_disconnect(websocket))
+            tasks.create_task(_forward(send, updates))
+            tasks.create_task(_read_commands(websocket, session, link_timeout))
+            tasks.create_task(session.run_motors())
     except* ViewerLeft:
         pass
 
 
-async def _forward(websocket: WebSocket, updates: asyncio.Queue[str]) -> None:
+async def _forward(send: Callable[[str], Awaitable[None]], updates: asyncio.Queue[str]) -> None:
     while True:
-        await websocket.send_text(await updates.get())
+        await send(await updates.get())
 
 
-async def _listen_until_disconnect(websocket: WebSocket) -> None:
-    # A closing browser sends a disconnect message, and listening is how it is
-    # noticed at once rather than on the next failed send. Anything else the
-    # viewer sends is ignored for now; the producer sets the pace, so a chatty
-    # client cannot speed the stream up.
+async def _read_commands(websocket: WebSocket, session: DriveSession, link_timeout: float) -> None:
+    """Read commands until the viewer disconnects, and stop on silence.
+
+    A closing browser sends a disconnect message, and listening is how it is
+    noticed at once rather than on the next failed send. A viewer that is only
+    watching sends nothing and may stay quiet forever; one that is driving
+    sends 20 commands a second, so `link_timeout` without one means the link
+    has gone and the motors stop - `VehicleController`'s fail-safe, as a
+    timeout rather than a timestamp. The page has to arm again after, so a
+    link that comes back with a stick still pushed does not lurch forward.
+    """
     while True:
-        message = await websocket.receive()
+        try:
+            async with asyncio.timeout(link_timeout if session.armed else None):
+                message = await websocket.receive()
+        except TimeoutError:
+            await session.disarm(f"No command for {link_timeout:g}s - stopped")
+            continue
         if message["type"] == "websocket.disconnect":
             raise ViewerLeft
+        await _handle_command(session, _parse(message))
+
+
+def _parse(message: dict[str, Any]) -> dict[str, Any] | None:
+    text = message.get("text")
+    if text is None:
+        return None
+    try:
+        command = json.loads(text)
+    except ValueError:
+        return None
+    return command if isinstance(command, dict) else None
+
+
+async def _handle_command(session: DriveSession, command: dict[str, Any] | None) -> None:
+    # Anything that is not a well-formed command is ignored, not an error: the
+    # stream is for watchers too, and a stray message must not cost them it.
+    # The producer sets the pace, so a chatty client cannot speed it up.
+    if command is None:
+        return
+    kind = command.get("type")
+    if kind == "arm":
+        await session.arm()
+    elif kind == "stop":
+        await session.disarm("Stopped")
+    elif kind == "drive":
+        throttle, steer = axis(command.get("throttle")), axis(command.get("steer"))
+        if throttle is not None and steer is not None:
+            session.command(throttle, steer)
 
 
 async def mjpeg_parts(request: Request, service: CameraService) -> AsyncIterator[bytes]:

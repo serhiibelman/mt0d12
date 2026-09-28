@@ -1,3 +1,4 @@
+import threading
 from datetime import datetime, timezone
 
 import pytest
@@ -13,6 +14,12 @@ class FakeVehicleStatusService:
         self.stop_calls = 0
         # Settable so a test can watch a change arrive over /ws/status.
         self.voltage = 12.4
+        # Driving: the route calls these from worker threads.
+        self.drive_owner: object | None = None
+        self.drive_commands: list[tuple[int, int]] = []
+        self.drive_closes = 0
+        self.drive_error: str | None = None
+        self._drive_lock = threading.Lock()
 
     def start(self) -> None:
         return None
@@ -43,6 +50,27 @@ class FakeVehicleStatusService:
             "detail": "All motors ramped down to 0 rpm",
             "timestamp": now,
         }
+
+    def open_drive(self, owner: object) -> None:
+        with self._drive_lock:
+            if self.drive_owner is not None:
+                raise RuntimeError("Another viewer is driving")
+            self.drive_owner = owner
+
+    def drive(self, owner: object, left_rpm: int, right_rpm: int) -> None:
+        with self._drive_lock:
+            if owner is not self.drive_owner:
+                return
+            if self.drive_error is not None:
+                raise RuntimeError(self.drive_error)
+            self.drive_commands.append((left_rpm, right_rpm))
+
+    def close_drive(self, owner: object | None = None) -> None:
+        with self._drive_lock:
+            if self.drive_owner is None or (owner is not None and owner is not self.drive_owner):
+                return
+            self.drive_owner = None
+            self.drive_closes += 1
 
     def snapshot(self) -> dict:
         now = datetime.now(timezone.utc)
@@ -183,9 +211,10 @@ def make_camera_service():
 
 @pytest.fixture()
 def build_app(vehicle_service, camera_service):
-    def _build(vehicle=None, camera=None):
+    def _build(vehicle=None, camera=None, drive_link_timeout=0.5):
         vehicle = vehicle or vehicle_service
         return create_app(
+            drive_link_timeout=drive_link_timeout,
             vehicle_status_service=vehicle,
             camera_service=camera or camera_service,
             # 5 Hz is right for a browser; a test does not need to sit through it.

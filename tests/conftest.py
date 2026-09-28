@@ -156,7 +156,7 @@ class FakeCameraService:
     def release_client_slot(self) -> None:
         self.slots -= 1
 
-    def next_frame(self, last_seq: int):
+    async def next_frame(self, last_seq: int):
         frames = [b"first", b"second"]
         next_seq = last_seq + 1
         if next_seq >= len(frames):

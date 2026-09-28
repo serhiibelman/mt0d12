@@ -13,8 +13,7 @@ import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
-from fastapi import Request, WebSocket
-from fastapi.concurrency import run_in_threadpool
+from fastapi import WebSocket
 
 from apps.api.exceptions import ViewerLeft
 from apps.api.services.camera import CameraService
@@ -121,28 +120,27 @@ async def _handle_command(session: DriveSession, command: dict[str, Any] | None)
             session.command(throttle, steer)
 
 
-async def mjpeg_parts(request: Request, service: CameraService) -> AsyncIterator[bytes]:
-    """Yield MJPEG parts until the camera stops or the viewer goes away.
+async def mjpeg_parts(service: CameraService) -> AsyncIterator[bytes]:
+    """Yield MJPEG parts until the camera stops.
 
-    The frame wait is blocking, so it runs in a worker thread; the generator
-    itself stays async so a disconnect reliably reaches the ``finally`` and
-    hands the viewer slot back.
+    The wait for a frame is a coroutine, so a viewer costs the event loop
+    nothing between frames and holds no worker thread. A viewer leaving is
+    Starlette's to notice: `StreamingResponse` listens for the disconnect and
+    cancels this generator. The viewer slot is handed back by the route's
+    background task, which runs even when the generator never started.
     """
-    try:
-        last_seq = -1
-        while not await request.is_disconnected():
-            try:
-                result = await run_in_threadpool(service.next_frame, last_seq)
-            except RuntimeError:
-                # The camera died mid-stream; /camera/status carries the reason.
-                break
-            if result is None:
-                break
-            last_seq, frame = result
-            yield (
-                f"--{MJPEG_BOUNDARY}\r\n"
-                f"Content-Type: image/jpeg\r\n"
-                f"Content-Length: {len(frame)}\r\n\r\n"
-            ).encode() + frame + b"\r\n"
-    finally:
-        service.release_client_slot()
+    last_seq = -1
+    while True:
+        try:
+            result = await service.next_frame(last_seq)
+        except RuntimeError:
+            # The camera died mid-stream; /camera/status carries the reason.
+            return
+        if result is None:
+            return
+        last_seq, frame = result
+        yield (
+            f"--{MJPEG_BOUNDARY}\r\n"
+            f"Content-Type: image/jpeg\r\n"
+            f"Content-Length: {len(frame)}\r\n\r\n"
+        ).encode() + frame + b"\r\n"

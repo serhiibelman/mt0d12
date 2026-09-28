@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import io
-from threading import Condition, RLock
+from threading import Condition, RLock, Timer
 from typing import Any, Callable
 
 from apps.api.services.components import ComponentSnapshot, utc_now
@@ -139,6 +140,12 @@ class CameraService:
     A single capture thread inside the backend publishes frames here; readers
     always get the latest one and silently drop whatever they missed, so a slow
     viewer can never stall capture.
+
+    Stream viewers wait on the event loop, not in worker threads: each frame
+    costs one `call_soon_threadsafe` hop however many viewers there are, and a
+    viewer holds no threadpool slot while it waits. Once the last viewer has
+    gone for `idle_stop_seconds` the camera shuts down, so the sensor is only
+    powered while someone is watching.
     """
 
     def __init__(
@@ -153,6 +160,7 @@ class CameraService:
         encoder: str = CAMERA_ENCODER,
         buffer_count: int = CAMERA_BUFFER_COUNT,
         frame_timeout_seconds: float = 5.0,
+        idle_stop_seconds: float = 2.0,
         backend_factory: Callable[..., Picamera2Backend] = Picamera2Backend,
     ):
         self.enabled = enabled
@@ -164,6 +172,7 @@ class CameraService:
         self.encoder = encoder
         self.buffer_count = buffer_count
         self.frame_timeout_seconds = frame_timeout_seconds
+        self.idle_stop_seconds = idle_stop_seconds
         self.active_encoder: str | None = None
         self._backend_factory = backend_factory
         self._backend: Picamera2Backend | None = None
@@ -175,6 +184,11 @@ class CameraService:
         self._last_frame_at = None
         self._clients = 0
         self._running = False
+        self._idle_timer: Timer | None = None
+        # Bound by the first async viewer. The capture thread wakes viewers
+        # through it; `_frame_ready` is only ever touched on that loop.
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._frame_ready: asyncio.Event | None = None
         self._component = ComponentSnapshot(
             configured=enabled,
             connected=False,
@@ -188,6 +202,7 @@ class CameraService:
 
     def stop(self) -> dict[str, Any]:
         with self._state_lock:
+            self._cancel_idle_timer()
             backend, self._backend = self._backend, None
             self._running = False
             if backend is not None:
@@ -202,6 +217,7 @@ class CameraService:
             self._frame = None
             self._frame_seq += 1
             self._frame_condition.notify_all()
+        self._wake_viewers()
 
         self._set_component(connected=False, detail="Camera capture stopped")
         return self._command_response(action="stop", detail="Camera capture stopped")
@@ -245,44 +261,60 @@ class CameraService:
 
         Called before the response starts so a full camera or a dead sensor can
         still be answered with a status code instead of a truncated stream.
+        Blocks while the camera opens, so async callers run it in a thread.
         """
-        self.ensure_running()
+        # One critical section, so an idle stop cannot slip in between the
+        # camera starting and the slot being counted.
         with self._state_lock:
             if self._clients >= self.max_clients:
                 raise RuntimeError(
                     f"Camera stream already has {self._clients} of {self.max_clients} viewers"
                 )
+            self._cancel_idle_timer()
+            self.ensure_running()
             self._clients += 1
 
     def release_client_slot(self) -> None:
         with self._state_lock:
             self._clients = max(0, self._clients - 1)
+            if self._clients == 0 and self._running:
+                # A short grace period, so a page reload or a quick re-arm
+                # does not pay for reopening the sensor.
+                self._cancel_idle_timer()
+                self._idle_timer = Timer(self.idle_stop_seconds, self._stop_if_idle)
+                self._idle_timer.daemon = True
+                self._idle_timer.start()
 
-    def next_frame(self, last_seq: int) -> tuple[int, bytes] | None:
-        """Block until a frame newer than ``last_seq`` arrives.
+    async def next_frame(self, last_seq: int) -> tuple[int, bytes] | None:
+        """Wait on the event loop for a frame newer than ``last_seq``.
 
         Returns ``None`` once the camera has been stopped, which ends the stream.
         """
-        with self._state_lock:
-            if not self._running:
-                return None
-
-        with self._frame_condition:
-            # `_running` is published before stop() notifies, so a stopped camera
-            # always wins over waiting for a frame that will never arrive.
-            if not self._frame_condition.wait_for(
-                lambda: not self._running
-                or (self._frame is not None and self._frame_seq != last_seq),
-                timeout=self.frame_timeout_seconds,
-            ):
-                self._set_component(
-                    connected=False,
-                    detail=f"No frame received within {self.frame_timeout_seconds}s",
-                )
-                raise RuntimeError("Timed out waiting for a camera frame")
-            if self._frame is None or not self._running:
-                return None
-            return self._frame_seq, self._frame
+        try:
+            async with asyncio.timeout(self.frame_timeout_seconds):
+                while True:
+                    with self._frame_condition:
+                        if not self._running:
+                            return None
+                        if self._frame is not None and self._frame_seq != last_seq:
+                            return self._frame_seq, self._frame
+                        # Taken under the lock the capture thread publishes
+                        # under, so a frame is either seen above or wakes
+                        # this event - never lost in between.
+                        loop = asyncio.get_running_loop()
+                        if self._loop is not loop:
+                            self._loop, self._frame_ready = loop, None
+                        if self._frame_ready is None:
+                            self._frame_ready = asyncio.Event()
+                        ready = self._frame_ready
+                    await ready.wait()
+        except TimeoutError:
+            pass
+        self._set_component(
+            connected=False,
+            detail=f"No frame received within {self.frame_timeout_seconds}s",
+        )
+        raise RuntimeError("Timed out waiting for a camera frame")
 
     def capture_frame(self) -> bytes:
         """Return the next freshly captured JPEG frame."""
@@ -333,6 +365,39 @@ class CameraService:
             self._frames_captured += 1
             self._last_frame_at = utc_now()
             self._frame_condition.notify_all()
+        self._wake_viewers()
+
+    def _wake_viewers(self) -> None:
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(self._set_frame_ready)
+        except RuntimeError:
+            # The loop has closed (shutdown, or a test's `asyncio.run` ended);
+            # nobody is left waiting on it.
+            self._loop = None
+
+    def _set_frame_ready(self) -> None:
+        # Swapped for a fresh event, so each waiter sees one set per frame.
+        ready, self._frame_ready = self._frame_ready, None
+        if ready is not None:
+            ready.set()
+
+    def _stop_if_idle(self) -> None:
+        with self._state_lock:
+            if self._clients or not self._running:
+                return
+            try:
+                self.stop()
+            except RuntimeError:
+                # stop() already recorded the failure on the component.
+                pass
+
+    def _cancel_idle_timer(self) -> None:
+        timer, self._idle_timer = self._idle_timer, None
+        if timer is not None:
+            timer.cancel()
 
     def _command_response(self, *, action: str, detail: str) -> dict[str, Any]:
         with self._state_lock:

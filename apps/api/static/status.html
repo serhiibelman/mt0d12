@@ -11,36 +11,22 @@
   without internet, so everything the page needs is served by the Pi itself.
 -->
 <style>
+  /* Dark in every browser, whatever the OS asks for: the page is mostly
+     used outdoors at dusk or on a phone next to the rover. */
   :root {
-    color-scheme: light dark;
-    --bg: #f4f5f7;
-    --card: #ffffff;
-    --text: #1c1f24;
-    --muted: #666d78;
-    --line: #dfe2e7;
-    --ok: #1f8a4c;
-    --warn: #b7791f;
-    --bad: #c53030;
-    --idle: #8a919c;
-    --sky: #7fb3e6;
-    --ground: #a8815a;
-    --accent: #2b6cb0;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #121418;
-      --card: #1c1f25;
-      --text: #e6e8eb;
-      --muted: #9aa1ac;
-      --line: #2e323a;
-      --ok: #3fbf74;
-      --warn: #e0a43a;
-      --bad: #f06363;
-      --idle: #6f7682;
-      --sky: #35618f;
-      --ground: #6e5238;
-      --accent: #5a9bdc;
-    }
+    color-scheme: dark;
+    --bg: #121418;
+    --card: #1c1f25;
+    --text: #e6e8eb;
+    --muted: #9aa1ac;
+    --line: #2e323a;
+    --ok: #3fbf74;
+    --warn: #e0a43a;
+    --bad: #f06363;
+    --idle: #6f7682;
+    --sky: #35618f;
+    --ground: #6e5238;
+    --accent: #5a9bdc;
   }
   * { box-sizing: border-box; }
   body {
@@ -139,7 +125,49 @@
   th, td { padding: 5px 0; text-align: right; border-top: 1px solid var(--line); }
   th { color: var(--muted); font-weight: 400; border-top: 0; }
   th:first-child, td:first-child { text-align: left; }
-  .drive { grid-column: 1 / -1; }
+  .drive, .camera { grid-column: 1 / -1; }
+  .screen {
+    position: relative;
+    aspect-ratio: 4 / 3;
+    max-height: 70vh;
+    margin: 0 auto;
+    overflow: hidden;
+    border-radius: 6px;
+    background: #000;
+  }
+  .screen img { display: block; width: 100%; height: 100%; object-fit: contain; }
+  .screen-message {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    color: #9aa1ac;
+    font-size: 13px;
+    text-align: center;
+  }
+  .screen-message strong { font-size: 22px; letter-spacing: .12em; color: #e6e8eb; }
+  .screen[data-state="live"] .screen-message { display: none; }
+  /* Static noise, as an old TV shows with no signal: two stacked stripe
+     patterns shifting against each other, pure CSS so nothing is fetched. */
+  .screen[data-state="nosignal"] {
+    background:
+      repeating-linear-gradient(0deg, #0000 0 2px, #ffffff0d 2px 3px),
+      repeating-linear-gradient(90deg, #1a1a1a 0 3px, #262626 3px 5px, #141414 5px 8px);
+    animation: static .25s steps(4) infinite;
+  }
+  .screen[data-state="nosignal"] .screen-message strong { color: var(--bad); }
+  @keyframes static {
+    0% { background-position: 0 0, 0 0; }
+    25% { background-position: 0 1px, 3px 0; }
+    50% { background-position: 0 2px, -2px 0; }
+    75% { background-position: 0 1px, 5px 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .screen[data-state="nosignal"] { animation: none; }
+  }
   .drive-body { display: flex; flex-wrap: wrap; align-items: center; gap: 16px 24px; }
   .pad {
     position: relative;
@@ -199,6 +227,16 @@
 </header>
 
 <main>
+  <section class="camera">
+    <h2>Camera</h2>
+    <div class="screen" id="screen" data-state="off">
+      <div class="screen-message">
+        <strong id="screen-title">Camera off</strong>
+        <span id="screen-detail">Arm to start the video with the motors.</span>
+      </div>
+    </div>
+  </section>
+
   <section class="drive">
     <h2>Drive</h2>
     <div class="drive-body">
@@ -446,6 +484,9 @@ function setDriveState(isArmed, detail) {
   driveBadge.textContent = armed ? "Armed" : "Not armed";
   driveBadge.className = `badge ${armed ? "ok" : ""}`.trim();
   $("drive-detail").textContent = detail;
+  // Video runs exactly while the motors do.
+  if (armed) startCamera();
+  else stopCamera();
 }
 
 function arm() {
@@ -526,6 +567,96 @@ document.addEventListener("keydown", (event) => {
 document.addEventListener("keyup", (event) => keys.delete(KEYS[event.code]));
 // A key released while the window was not looking would stay "held" forever.
 window.addEventListener("blur", () => { keys.clear(); releasePad(); });
+
+// -- Camera -----------------------------------------------------------------
+// An <img> on /camera/stream: the browser decodes MJPEG natively, with no
+// JavaScript per frame. The rover powers the sensor down a moment after the
+// last viewer leaves, so dropping the image is all Stop needs to do.
+
+const CAMERA_URL = "/camera/stream";
+// Opening the sensor takes a second or two on a Pi 1.
+const CAMERA_CONNECT_TIMEOUT_MS = 8000;
+const CAMERA_RETRY_MS = 3000;
+const CAMERA_CHECK_MS = 2000;
+
+let cameraImg = null;
+let cameraTimer = null;
+let cameraFrames = null;
+
+function setScreen(state, title, detail) {
+  $("screen").dataset.state = state;
+  $("screen-title").textContent = title;
+  $("screen-detail").textContent = detail;
+}
+
+function startCamera() {
+  if (cameraImg) return;
+  clearTimeout(cameraTimer);
+  cameraFrames = null;
+  const img = new Image();
+  img.alt = "Live view from the rover's camera";
+  // Chrome fires load once for a multipart stream, Firefox on every frame;
+  // either way the first one means the picture is up.
+  img.onload = () => {
+    if (cameraImg !== img || $("screen").dataset.state === "live") return;
+    setScreen("live", "", "");
+    clearTimeout(cameraTimer);
+    cameraTimer = setTimeout(checkCamera, CAMERA_CHECK_MS);
+  };
+  // A 503 (camera missing, disabled or full) or a dropped connection.
+  img.onerror = () => { if (cameraImg === img) noSignal("The rover is not sending video."); };
+  img.src = `${CAMERA_URL}?t=${Date.now()}`;
+  cameraImg = img;
+  $("screen").prepend(img);
+  setScreen("connecting", "Connecting…", "Starting the camera.");
+  cameraTimer = setTimeout(() => noSignal("The camera did not answer."), CAMERA_CONNECT_TIMEOUT_MS);
+}
+
+function dropImage() {
+  clearTimeout(cameraTimer);
+  cameraTimer = null;
+  if (!cameraImg) return;
+  const img = cameraImg;
+  cameraImg = null;
+  img.onload = img.onerror = null;
+  // Clearing src is what makes the browser close the stream connection.
+  img.removeAttribute("src");
+  img.remove();
+}
+
+function stopCamera() {
+  dropImage();
+  setScreen("off", "Camera off", "Arm to start the video with the motors.");
+}
+
+function noSignal(detail) {
+  dropImage();
+  setScreen("nosignal", "No signal", `${detail} Retrying…`);
+  cameraTimer = setTimeout(() => { if (armed) startCamera(); }, CAMERA_RETRY_MS);
+}
+
+// A stream whose camera died just ends, and the <img> keeps showing the last
+// frame as if it were live. The frame counter moving is the only proof it is.
+async function checkCamera() {
+  if (!cameraImg || $("screen").dataset.state !== "live") return;
+  let status = null;
+  try {
+    const response = await fetch("/camera/status", { cache: "no-store" });
+    if (response.ok) status = await response.json();
+  } catch {
+    // A failed poll is not proof of a dead camera; the socket watches the link.
+  }
+  if (!cameraImg || $("screen").dataset.state !== "live") return;
+  if (status) {
+    const frozen = cameraFrames !== null && status.frames_captured === cameraFrames;
+    if (!status.running || !status.component.connected || frozen) {
+      noSignal(status.component.detail || "The camera stopped sending frames.");
+      return;
+    }
+    cameraFrames = status.frames_captured;
+  }
+  cameraTimer = setTimeout(checkCamera, CAMERA_CHECK_MS);
+}
 
 // -- Rendering --------------------------------------------------------------
 // Everything goes in through textContent, never innerHTML, so nothing in a

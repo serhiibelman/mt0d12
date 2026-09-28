@@ -125,9 +125,11 @@ curl -X POST http://<vehicle-host>:8000/camera/stop
 
 Notes:
 
-1. The camera opens on the first `/camera/stream` or `/camera/snapshot` request, so the
-   sensor stays powered down while nobody is watching. `POST /camera/start` warms it up
-   ahead of time and `POST /camera/stop` releases it.
+1. The camera opens on the first `/camera/stream` or `/camera/snapshot` request, and
+   closes again two seconds after the last stream viewer leaves, so the sensor stays
+   powered down while nobody is watching. `POST /camera/start` warms it up ahead of time
+   and `POST /camera/stop` releases it. The status page opens the stream when you press
+   Arm and drops it on Stop, so video runs exactly while the motors do.
 2. All viewers share one capture pipeline and always receive the newest frame; a slow
    viewer drops frames instead of holding up capture or the motor loop.
 3. `CAMERA_MAX_CLIENTS` (default 4) caps concurrent viewers; extra ones get `503`.
@@ -139,7 +141,7 @@ Notes:
 ### Raspberry Pi 1 Model B+
 
 The Pi 1 is the weakest board picamera2 supports, so the defaults in `.env.example` are
-sized for it (320x240 at 10 fps):
+sized for it (640x480 at 10 fps):
 
 1. **32-bit Raspberry Pi OS only.** ARMv6 cannot run the 64-bit images. Use the Lite
    image - 512 MB shared with the GPU leaves no room for a desktop.

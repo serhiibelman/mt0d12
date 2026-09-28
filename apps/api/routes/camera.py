@@ -1,5 +1,7 @@
-from fastapi import APIRouter, HTTPException, Request, Response, status
+from fastapi import APIRouter, HTTPException, Response, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 
 from apps.api.dependencies import CameraServiceDep
 from apps.api.schemas import CameraCommandResponse, CameraStatusResponse
@@ -15,18 +17,22 @@ NO_CACHE_HEADERS = {
 
 
 @router.get("/stream")
-def stream(request: Request, service: CameraServiceDep) -> StreamingResponse:
+async def stream(service: CameraServiceDep) -> StreamingResponse:
+    """`async def`, so a viewer waits for frames as a coroutine; only opening
+    the camera, which blocks for a second or so, goes to a thread."""
     try:
-        service.acquire_client_slot()
+        await run_in_threadpool(service.acquire_client_slot)
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
         ) from exc
     return StreamingResponse(
-        mjpeg_parts(request, service),
+        mjpeg_parts(service),
         media_type=f"multipart/x-mixed-replace; boundary={MJPEG_BOUNDARY}",
         headers=NO_CACHE_HEADERS,
+        # Runs once streaming ends for any reason, the viewer leaving included.
+        background=BackgroundTask(service.release_client_slot),
     )
 
 

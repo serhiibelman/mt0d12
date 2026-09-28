@@ -211,12 +211,17 @@ def test_packets_that_land_during_a_pass_collapse_to_the_newest() -> None:
     run(scenario)
 
 
-def test_a_slow_bus_never_stalls_the_event_loop() -> None:
-    """What PYTHONASYNCIODEBUG=1 checks: no step over slow_callback_duration.
+# What PYTHONASYNCIODEBUG=1 reports: any step over slow_callback_duration. The
+# motors take 100 ms each here, as one that does not answer does, so a pass on
+# the loop is one 400 ms step. The threshold sits at half that: a shared CI
+# runner has been seen to stretch an ordinary step to 50 ms, and that is not
+# what this is looking for.
+SLOW_STEP = 0.2
 
-    The motors take 100 ms each here, as one that does not answer does. Called
-    on the loop, every pass would be a 400 ms step.
-    """
+
+def slow_steps_while_driving(controller_factory=None, drive_packets: int = 6) -> list[str]:
+    """Drive a few passes over a 100 ms-per-motor bus in debug mode, and
+    return the slow-step warnings asyncio logged."""
     slow_steps: list[str] = []
 
     class Catch(logging.Handler):
@@ -225,12 +230,13 @@ def test_a_slow_bus_never_stalls_the_event_loop() -> None:
                 slow_steps.append(record.getMessage())
 
     async def main() -> None:
-        loop = asyncio.get_running_loop()
-        loop.slow_callback_duration = 0.05
+        asyncio.get_running_loop().slow_callback_duration = SLOW_STEP
         rig = Rig(FakeMotor(delay=0.1))
+        if controller_factory is not None:
+            controller_factory(rig.controller)
         task = asyncio.create_task(rig.controller.run(rig.packets))
         rig.send(a=True)
-        for _ in range(6):
+        for _ in range(drive_packets):
             await asyncio.sleep(0.05)
             rig.send(left_y=-1.0)
         await settle(lambda: len(rig.motor.commands) >= 8)
@@ -246,8 +252,25 @@ def test_a_slow_bus_never_stalls_the_event_loop() -> None:
         asyncio.run(main(), debug=True)
     finally:
         logging.getLogger("asyncio").removeHandler(handler)
+    return slow_steps
 
-    assert slow_steps == []
+
+def test_a_slow_bus_never_stalls_the_event_loop() -> None:
+    assert slow_steps_while_driving() == []
+
+
+def test_the_stall_check_does_catch_a_bus_on_the_loop() -> None:
+    # The control for the test above: with the bus called straight from the
+    # loop, as before the worker thread, the same run must be reported - or
+    # the threshold has drifted to where the check can no longer fail.
+    def on_the_loop(controller):
+        async def direct(action, *args):
+            action(*args)
+
+        controller._on_bus = direct
+
+    # One blocked pass is proof enough; six would only add seconds.
+    assert slow_steps_while_driving(on_the_loop, drive_packets=1) != []
 
 
 def test_cancelling_mid_pass_still_ends_with_the_motors_stopped() -> None:

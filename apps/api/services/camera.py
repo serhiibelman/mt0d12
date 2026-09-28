@@ -4,7 +4,7 @@ import io
 from threading import Condition, RLock
 from typing import Any, Callable
 
-from apps.api.services.vehicle_status import ComponentSnapshot, utc_now
+from apps.api.services.components import ComponentSnapshot, utc_now
 from settings import (
     CAMERA_BUFFER_COUNT,
     CAMERA_ENABLED,

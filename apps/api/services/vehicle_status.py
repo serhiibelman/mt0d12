@@ -1,73 +1,23 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
-from math import degrees
-from time import monotonic, sleep
+from dataclasses import asdict
+from time import sleep
 from threading import Event, Lock, Thread
 from typing import Any, Callable
 
-from pymavlink import mavutil
 from serial import SerialException
 
 from lib.ddsm115 import DDS115
+from apps.api.services.components import ComponentSnapshot, utc_now
+from apps.api.services.flight_controller import FlightControllerStream
 from apps.api.services.pi_health import PI_HEALTH_UNAVAILABLE, PiHealthReader
 from apps.vehicle_control.vehicle_controller import LOOP_INTERVAL, MAX_RPM, VehicleController
 from settings import DEVICE, FC_BAUDRATE, FC_DEVICE, LEFT_SIDE, RIGHT_SIDE
 
 logger = logging.getLogger(__name__)
 
-FC_HEARTBEAT_TIMEOUT_SECONDS = 1.0
-
-# SYS_STATUS reports "no reading" in-band rather than as null, and the
-# sentinels are values that look plausible: 65535 mV reads as a 65 V battery
-# unless it is caught here.
-VOLTAGE_UNKNOWN = 65535  # uint16 max, millivolts
-CURRENT_UNKNOWN = -1  # centiamps
-REMAINING_UNKNOWN = -1  # percent
-
-BATTERY_UNAVAILABLE = {"voltage_v": None, "current_a": None, "remaining_percent": None}
-ATTITUDE_UNAVAILABLE = {"roll_deg": None, "pitch_deg": None, "yaw_deg": None}
-
 DRIVER_HOLDS_BUS = "Held open by a driver on the status page"
-
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def battery_from(message: Any) -> dict[str, Any]:
-    """Volts, amps and percent out of SYS_STATUS, which reports mV, cA and %."""
-    voltage = message.voltage_battery
-    current = message.current_battery
-    remaining = message.battery_remaining
-    return {
-        "voltage_v": None if voltage == VOLTAGE_UNKNOWN else round(voltage / 1000, 1),
-        "current_a": None if current == CURRENT_UNKNOWN else round(current / 100, 2),
-        "remaining_percent": None if remaining == REMAINING_UNKNOWN else int(remaining),
-    }
-
-
-def attitude_from(message: Any) -> dict[str, Any]:
-    """Degrees out of ATTITUDE, which reports radians.
-
-    The units are in the field names on purpose: radians arriving somewhere
-    that expects degrees is the classic way this goes wrong quietly.
-    """
-    return {
-        "roll_deg": round(degrees(message.roll), 1),
-        "pitch_deg": round(degrees(message.pitch), 1),
-        "yaw_deg": round(degrees(message.yaw), 1),
-    }
-
-
-@dataclass(frozen=True)
-class ComponentSnapshot:
-    configured: bool
-    connected: bool
-    detail: str
-    checked_at: datetime
 
 
 class VehicleStatusService:
@@ -79,18 +29,18 @@ class VehicleStatusService:
         fc_baudrate: int = FC_BAUDRATE,
         probe_interval_seconds: float = 2.0,
         motor_factory: Callable[..., DDS115] = DDS115,
-        fc_factory: Callable[..., Any] = mavutil.mavlink_connection,
-        fc_read_seconds: float = 0.6,
+        flight_controller: FlightControllerStream | None = None,
         sleep_func: Callable[[float], None] = sleep,
         pi_health_reader: Callable[[], dict[str, Any]] | None = None,
     ):
         self.motor_device = motor_device
-        self.fc_device = fc_device
-        self.fc_baudrate = fc_baudrate
         self.probe_interval_seconds = probe_interval_seconds
         self._motor_factory = motor_factory
-        self._fc_factory = fc_factory
-        self.fc_read_seconds = fc_read_seconds
+        # Read continuously on the event loop, not by the probe thread; see
+        # `start_streams`. The probe keeps the motor bus and the Pi.
+        self.flight_controller = flight_controller or FlightControllerStream(
+            device=fc_device, baudrate=fc_baudrate
+        )
         self._sleep = sleep_func
         self._read_pi_health = pi_health_reader or PiHealthReader()
         self._stop_event = Event()
@@ -110,19 +60,11 @@ class VehicleStatusService:
                 detail="Probe has not run yet",
                 checked_at=utc_now(),
             ),
-            "flight_controller": ComponentSnapshot(
-                configured=bool(self.fc_device),
-                connected=False,
-                detail="Probe has not run yet",
-                checked_at=utc_now(),
-            ),
         }
         self._motor_feedback = [
             {"motor_id": motor_id, "rpm": None, "current_raw": None}
             for motor_id in LEFT_SIDE + RIGHT_SIDE
         ]
-        self._battery = dict(BATTERY_UNAVAILABLE)
-        self._attitude = dict(ATTITUDE_UNAVAILABLE)
         self._pi = dict(PI_HEALTH_UNAVAILABLE)
 
     def start(self) -> None:
@@ -132,6 +74,13 @@ class VehicleStatusService:
         self._stop_event.clear()
         self._thread = Thread(target=self._probe_loop, daemon=True)
         self._thread.start()
+
+    async def start_streams(self) -> None:
+        """Start what runs on the event loop: the flight controller stream."""
+        await self.flight_controller.start()
+
+    async def stop_streams(self) -> None:
+        await self.flight_controller.stop()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -143,26 +92,26 @@ class VehicleStatusService:
         self.close_drive()
 
     def snapshot(self) -> dict[str, Any]:
+        fc = self.flight_controller.reading()
         with self._lock:
             components = {name: asdict(component) for name, component in self._components.items()}
             motor_feedback = list(self._motor_feedback)
-            battery = dict(self._battery)
-            attitude = dict(self._attitude)
             pi = dict(self._pi)
+        components["flight_controller"] = asdict(fc.component)
 
         return {
             "service": "mt0d12-vehicle-api",
             "overall_status": self._overall_status(components),
             "timestamp": utc_now(),
             "motor_device": self.motor_device,
-            "fc_device": self.fc_device,
+            "fc_device": self.flight_controller.device,
             "motor_ids": {
                 "left": list(LEFT_SIDE),
                 "right": list(RIGHT_SIDE),
             },
             "components": components,
-            "battery": battery,
-            "attitude": attitude,
+            "battery": dict(fc.battery),
+            "attitude": dict(fc.attitude),
             "pi": pi,
             "motor_feedback": motor_feedback,
         }
@@ -256,26 +205,11 @@ class VehicleStatusService:
         a single time - by a test, or by anything that wants a fresh reading
         without waiting for the next tick."""
         motor_bus = self._probe_motor_bus()
-        flight_controller, battery, attitude = self._probe_flight_controller()
         pi = self._probe_pi()
 
         with self._lock:
             self._pi = pi
             self._components["motor_bus"] = motor_bus
-            self._components["flight_controller"] = flight_controller
-            if not flight_controller.connected:
-                # A reading from a link that has since dropped would read as
-                # current. Nothing known beats quietly wrong.
-                self._battery = dict(BATTERY_UNAVAILABLE)
-                self._attitude = dict(ATTITUDE_UNAVAILABLE)
-            else:
-                # SYS_STATUS streams slower than the probe runs, so a window
-                # that caught none keeps the last reading rather than blanking
-                # a battery that is still there.
-                if battery is not None:
-                    self._battery = battery
-                if attitude is not None:
-                    self._attitude = attitude
 
     def _probe_pi(self) -> dict[str, Any]:
         """The board's own health. Never costs the rest of the probe: a reader
@@ -326,106 +260,6 @@ class VehicleStatusService:
             detail="Serial device opened successfully; live motor telemetry is not wired yet",
             checked_at=checked_at,
         )
-
-    def _probe_flight_controller(
-        self,
-    ) -> tuple[ComponentSnapshot, dict[str, Any] | None, dict[str, Any] | None]:
-        """Probe the link and, while it is open, read what it has to say.
-
-        Returns the component health plus whatever battery and attitude
-        arrived in the read window - `None` for either means "nothing this
-        time", which the caller treats differently from "nothing there".
-        """
-        checked_at = utc_now()
-        if not self.fc_device:
-            return (
-                ComponentSnapshot(
-                    configured=False,
-                    connected=False,
-                    detail="FC_DEVICE is not configured",
-                    checked_at=checked_at,
-                ),
-                None,
-                None,
-            )
-
-        link = None
-        try:
-            link = self._fc_factory(self.fc_device, baud=self.fc_baudrate)
-            heartbeat = link.wait_heartbeat(timeout=FC_HEARTBEAT_TIMEOUT_SECONDS)
-            if heartbeat is None:
-                # wait_heartbeat returns None on timeout rather than raising,
-                # so a port that opens but never speaks has to be caught here.
-                return (
-                    ComponentSnapshot(
-                        configured=True,
-                        connected=False,
-                        detail=f"No heartbeat within {FC_HEARTBEAT_TIMEOUT_SECONDS:g}s",
-                        checked_at=checked_at,
-                    ),
-                    None,
-                    None,
-                )
-            battery, attitude = self._read_fc_telemetry(link)
-        except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
-            return (
-                ComponentSnapshot(
-                    configured=True,
-                    connected=False,
-                    detail=str(exc),
-                    checked_at=checked_at,
-                ),
-                None,
-                None,
-            )
-        finally:
-            if link is not None and hasattr(link, "close"):
-                link.close()
-
-        system_id = getattr(heartbeat, "get_srcSystem", lambda: None)()
-        return (
-            ComponentSnapshot(
-                configured=True,
-                connected=True,
-                detail=f"Heartbeat received from system {system_id}",
-                checked_at=checked_at,
-            ),
-            battery,
-            attitude,
-        )
-
-    def _read_fc_telemetry(self, link: Any) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        """One SYS_STATUS and one ATTITUDE, or as much as arrives in time.
-
-        The probe reopens the link every couple of seconds, so this cannot sit
-        and wait: anything that has not arrived by the deadline is left for the
-        next probe. Reading must never cost the health check, so a malformed
-        frame ends the window rather than failing the probe.
-        """
-        deadline = monotonic() + self.fc_read_seconds
-        battery: dict[str, Any] | None = None
-        attitude: dict[str, Any] | None = None
-
-        while battery is None or attitude is None:
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                break
-            try:
-                message = link.recv_match(
-                    type=["SYS_STATUS", "ATTITUDE"], blocking=True, timeout=remaining
-                )
-                if message is None:
-                    break
-                kind = message.get_type()
-                if kind == "SYS_STATUS" and battery is None:
-                    battery = battery_from(message)
-                elif kind == "ATTITUDE" and attitude is None:
-                    attitude = attitude_from(message)
-            except Exception as error:
-                logger.debug("Flight controller telemetry read failed", exc_info=error)
-                break
-
-        return battery, attitude
 
     @staticmethod
     def _overall_status(components: dict[str, dict[str, Any]]) -> str:

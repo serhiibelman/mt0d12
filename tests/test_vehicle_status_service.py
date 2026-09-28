@@ -205,119 +205,15 @@ def test_stopping_the_service_stops_a_driver_that_is_still_going() -> None:
     assert motors[0].closed is True
 
 
-# -- battery and attitude from the flight controller ------------------------
-
-
-class FakeMessage:
-    def __init__(self, kind: str, **fields):
-        self._kind = kind
-        for name, value in fields.items():
-            setattr(self, name, value)
-
-    def get_type(self) -> str:
-        return self._kind
-
-    def get_srcSystem(self) -> int:
-        return 1
-
-
-def sys_status(voltage=12400, current=183, remaining=76) -> FakeMessage:
-    """SYS_STATUS as MAVLink sends it: millivolts, centiamps, percent."""
-    return FakeMessage(
-        "SYS_STATUS",
-        voltage_battery=voltage,
-        current_battery=current,
-        battery_remaining=remaining,
-    )
-
-
-def attitude(roll=0.0, pitch=0.0, yaw=0.0) -> FakeMessage:
-    """ATTITUDE as MAVLink sends it: radians."""
-    return FakeMessage("ATTITUDE", roll=roll, pitch=pitch, yaw=yaw)
-
-
-class FakeLink:
-    """Stands in for a pymavlink connection, handing out queued messages."""
-
-    def __init__(self, messages=None, *, heartbeat=True):
-        self.messages = list(messages or [])
-        self.heartbeat = FakeMessage("HEARTBEAT") if heartbeat else None
-        self.closed = False
-
-    def wait_heartbeat(self, timeout=None):
-        return self.heartbeat
-
-    def recv_match(self, type=None, blocking=False, timeout=None):
-        while self.messages:
-            message = self.messages.pop(0)
-            if type is None or message.get_type() in type:
-                return message
-        return None
-
-    def close(self) -> None:
-        self.closed = True
-
-
-def make_fc_service(link, **overrides) -> VehicleStatusService:
-    fields = {
-        "motor_device": None,
-        "fc_device": "/dev/serial0",
-        "fc_factory": lambda *_args, **_kwargs: link,
-        "sleep_func": lambda _: None,
-    }
-    fields.update(overrides)
-    return VehicleStatusService(**fields)
-
-
-def probe_once(service: VehicleStatusService) -> dict:
-    """Run one probe pass without starting the background thread."""
-    service._probe_once()
-    return service.snapshot()
-
-
-def test_battery_is_converted_out_of_the_units_mavlink_uses() -> None:
-    # SYS_STATUS reports mV, cA and %; nothing downstream should have to know.
-    service = make_fc_service(FakeLink([sys_status(voltage=12400, current=183, remaining=76)]))
-
-    battery = probe_once(service)["battery"]
-
-    assert battery == {"voltage_v": 12.4, "current_a": 1.83, "remaining_percent": 76}
-
-
-def test_attitude_is_converted_from_radians_to_degrees() -> None:
-    service = make_fc_service(FakeLink([attitude(roll=0.0175, pitch=-0.0349, yaw=3.1416)]))
-
-    assert probe_once(service)["attitude"] == {
-        "roll_deg": 1.0,
-        "pitch_deg": -2.0,
-        "yaw_deg": 180.0,
-    }
-
-
-def test_the_unknown_sentinels_become_null_rather_than_a_65_volt_battery() -> None:
-    # MAVLink reports "no reading" in band, with values that look plausible.
-    service = make_fc_service(FakeLink([sys_status(voltage=65535, current=-1, remaining=-1)]))
-
-    assert probe_once(service)["battery"] == {
-        "voltage_v": None,
-        "current_a": None,
-        "remaining_percent": None,
-    }
-
-
-def test_both_readings_arrive_from_one_probe() -> None:
-    service = make_fc_service(FakeLink([attitude(roll=0.0175), sys_status()]))
-
-    snapshot = probe_once(service)
-
-    assert snapshot["battery"]["voltage_v"] == 12.4
-    assert snapshot["attitude"]["roll_deg"] == 1.0
+# -- the flight controller, through the service ---------------------------
+# The stream itself is tested in test_flight_controller.py.
 
 
 def test_an_unconfigured_flight_controller_reports_nothing_known() -> None:
     service = VehicleStatusService(motor_device=None, fc_device=None, sleep_func=lambda _: None)
+    service._probe_once()
 
-    snapshot = probe_once(service)
+    snapshot = service.snapshot()
 
     assert snapshot["battery"] == {
         "voltage_v": None,
@@ -325,65 +221,5 @@ def test_an_unconfigured_flight_controller_reports_nothing_known() -> None:
         "remaining_percent": None,
     }
     assert snapshot["attitude"] == {"roll_deg": None, "pitch_deg": None, "yaw_deg": None}
-
-
-def test_a_port_that_opens_but_never_speaks_is_not_connected() -> None:
-    # wait_heartbeat returns None on timeout rather than raising, so a silent
-    # FC used to report as connected with a heartbeat "from system None".
-    service = make_fc_service(FakeLink(heartbeat=False))
-
-    snapshot = probe_once(service)
-
-    assert snapshot["components"]["flight_controller"]["connected"] is False
-    assert "No heartbeat" in snapshot["components"]["flight_controller"]["detail"]
+    assert snapshot["components"]["flight_controller"]["configured"] is False
     assert snapshot["overall_status"] == "degraded"
-
-
-def test_a_probe_that_catches_no_sys_status_keeps_the_last_battery() -> None:
-    # SYS_STATUS streams slower than the probe runs. Blanking the battery on
-    # every quiet window would make it flicker for no reason.
-    link = FakeLink([sys_status(voltage=12400)])
-    service = make_fc_service(link)
-    probe_once(service)
-
-    link.messages = [attitude(roll=0.0175)]
-    service._probe_once()
-
-    assert service.snapshot()["battery"]["voltage_v"] == 12.4
-
-
-def test_readings_are_dropped_when_the_link_goes_away() -> None:
-    # A value from a link that has since died would read as current.
-    link = FakeLink([sys_status(voltage=12400)])
-    service = make_fc_service(link)
-    probe_once(service)
-
-    link.heartbeat = None
-    service._probe_once()
-
-    assert service.snapshot()["battery"]["voltage_v"] is None
-    assert service.snapshot()["attitude"]["roll_deg"] is None
-
-
-def test_a_failing_read_costs_the_reading_not_the_health_check() -> None:
-    class Exploding(FakeLink):
-        def recv_match(self, **_kwargs):
-            raise ValueError("malformed frame")
-
-    service = make_fc_service(Exploding())
-
-    snapshot = probe_once(service)
-
-    assert snapshot["components"]["flight_controller"]["connected"] is True
-    assert snapshot["battery"]["voltage_v"] is None
-
-
-def test_the_link_is_closed_even_when_the_read_fails() -> None:
-    class Exploding(FakeLink):
-        def recv_match(self, **_kwargs):
-            raise ValueError("malformed frame")
-
-    link = Exploding()
-    probe_once(make_fc_service(link))
-
-    assert link.closed is True

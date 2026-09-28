@@ -27,6 +27,12 @@ class FakeVehicleStatusService:
     def stop(self) -> None:
         return None
 
+    async def start_streams(self) -> None:
+        return None
+
+    async def stop_streams(self) -> None:
+        return None
+
     def start_motors(self, rpm: int) -> dict:
         self.started_rpms.append(rpm)
         now = datetime.now(timezone.utc)

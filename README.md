@@ -57,6 +57,7 @@ disarms. Throttle ramps and steering mixes exactly as with the gamepad. While ar
 sends a command every 50 ms; half a second without one - Wi-Fi drop, sleeping laptop,
 hidden tab - stops the motors, and the page must be armed again. One driver at a time:
 a second tab is refused, and `/motors/start` answers 503 while someone drives.
+Why it is built this way: [docs/drive-over-websocket.md](docs/drive-over-websocket.md).
 
 Available endpoints:
 

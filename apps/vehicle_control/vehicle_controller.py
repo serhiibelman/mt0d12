@@ -1,13 +1,13 @@
 import asyncio
-import threading
-from typing import Any, Callable, Optional
+from typing import Optional
 
 from lib.common.formatting import print_info, print_warning
 from lib.gamepad.udp_receiver import ControllerStateProtocol
 from lib.gamepad.state import ControllerState
-from lib.ddsm115 import DDS115
-from settings import RIGHT_SIDE, LEFT_SIDE
+from lib.ddsm115 import MotorBus
 
+# Who holds the bus, in what another driver is told: "... is driving".
+DRIVER = "The gamepad"
 MAX_RPM = 200
 MAX_STEER_RPM = 100  # half of MAX_RPM for gentler turns
 RAMP_STEP = 5
@@ -25,13 +25,15 @@ class VehicleController:
     Controls vehicle motors based on gamepad input received over UDP.
 
     Runs on asyncio: `run` waits on the UDP protocol instead of polling the
-    socket on a timer. The motor bus blocks - each `send_rpm` waits for the
-    motor's reply, up to 100 ms for one that does not answer - so every pass
-    over the motors runs in a worker thread, and the event loop never stalls
-    on the serial port.
+    socket on a timer. It drives through the rover's one `MotorBus`, which it
+    shares with the status page and the /motors ramps, so it holds the bus
+    only while drive is on: pressing 'a' claims it, and turning drive off,
+    braking or losing the link releases it. While it does not hold the bus it
+    sends nothing - someone else may be driving.
 
     Control scheme:
-        - Press 'a' to toggle drive mode on/off.
+        - Press 'a' to toggle drive mode on/off. Refused, with a warning,
+          while someone else is driving.
         - Left joystick Y  → forward (up) / backward (down), RPM ramps smoothly.
         - Right joystick X → steering; blends with base RPM so the same input
           produces differential steering while moving and a tank turn when stopped.
@@ -40,21 +42,20 @@ class VehicleController:
           'a' must be pressed again once the link is back.
 
     Motor wiring convention (from actuator_test.py):
-        RIGHT_SIDE motors receive rpm * -1 to match the physical mounting direction.
+        RIGHT_SIDE motors receive rpm * -1 to match the physical mounting
+        direction; the bus applies it.
     """
 
-    def __init__(self, motor: DDS115, link_timeout: float = LINK_TIMEOUT):
-        self.motor = motor
+    def __init__(self, bus: MotorBus, link_timeout: float = LINK_TIMEOUT):
+        self.bus = bus
         self.link_timeout = link_timeout
         self._current_rpm: float = 0.0
-        self._braked: bool = False
         self._drive_enabled: bool = False
+        # Holds the bus: from 'a' until drive is off and the motors have
+        # ramped down to zero, or a brake or the fail-safe let it go.
+        self._holding: bool = False
         self._prev_a: bool = False  # for edge detection on 'a' toggle
         self._link_lost: bool = False
-        # One pass over the motors at a time. A worker thread cannot be
-        # cancelled, so on shutdown the final stop waits here for a pass still
-        # on the bus rather than writing over it.
-        self._bus_lock = threading.Lock()
 
     async def run(self, packets: ControllerStateProtocol) -> None:
         """Act on packets as they arrive until cancelled, then stop the motors."""
@@ -65,16 +66,22 @@ class VehicleController:
                     async with asyncio.timeout_at(self._link_deadline(packets)):
                         state = await packets.next_state()
                 except TimeoutError:
-                    await self._on_bus(self._fail_safe)
+                    await self._fail_safe()
                     continue
                 if self._link_lost:
                     self._link_lost = False
                     print_info("Control link restored - press 'a' to drive")
                 # Packets that land while this pass is on the bus are not
                 # queued: the protocol keeps the newest, which is taken next.
-                await self._on_bus(self._handle, state)
+                try:
+                    await self._handle(state)
+                except RuntimeError as exc:
+                    # The bus failed or was taken away under us.
+                    print_warning(f"Motor bus failed: {exc} - drive disabled")
+                    await self._let_go()
         finally:
-            await self._on_bus(self._stop_motors)
+            # Owner-checked: a no-op unless the gamepad holds the bus.
+            await self.bus.release(self)
 
     def _link_deadline(self, packets: ControllerStateProtocol) -> Optional[float]:
         """When silence becomes a lost link, in loop time; None for no limit.
@@ -89,25 +96,19 @@ class VehicleController:
             return None
         return packets.last_arrival + self.link_timeout
 
-    async def _on_bus(self, action: Callable[..., None], *args: Any) -> None:
-        """Run `action` in a worker thread, holding the bus."""
-
-        def locked() -> None:
-            with self._bus_lock:
-                action(*args)
-
-        await asyncio.to_thread(locked)
-
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _handle(self, state: ControllerState) -> None:
+    async def _handle(self, state: ControllerState) -> None:
         """Process one controller state snapshot and update motor outputs."""
         a_now = state.buttons.a
         if a_now and not self._prev_a:
-            self._drive_enabled = not self._drive_enabled
-            print_info(f"Drive {'ENABLED' if self._drive_enabled else 'DISABLED'}")
+            if self._drive_enabled:
+                self._drive_enabled = False
+                print_info("Drive DISABLED")
+            else:
+                self._enable()
         self._prev_a = a_now
 
         print(
@@ -116,12 +117,12 @@ class VehicleController:
             f"rpm={self._current_rpm:.0f}"
         )
 
-        if state.buttons.lb:
-            self._brake()
-            self._drive_enabled = False
+        if not self._holding:
             return
 
-        self._braked = False
+        if state.buttons.lb:
+            await self._brake()
+            return
 
         if self._drive_enabled:
             left_y = state.axes.left_y  # left joystick up/down: up = -1, down = +1
@@ -133,14 +134,25 @@ class VehicleController:
 
             left_rpm, right_rpm = self._compute_side_rpms(self._current_rpm, right_x)
         else:
-            # Drive off: ramp back to zero gradually
+            # Drive off: ramp back to zero gradually, then let the bus go.
             self._current_rpm = self._ramp_toward(self._current_rpm, 0.0)
-            left_rpm = self._current_rpm
-            right_rpm = self._current_rpm
+            left_rpm = right_rpm = self._current_rpm
 
-        self._apply(left_rpm, right_rpm)
+        await self.bus.drive(self, round(left_rpm), round(right_rpm))
+        if not self._drive_enabled and self._current_rpm == 0.0:
+            await self._let_go()
 
-    def _fail_safe(self) -> None:
+    def _enable(self) -> None:
+        try:
+            self.bus.claim(self, DRIVER)
+        except RuntimeError as exc:
+            print_warning(f"Cannot drive: {exc}")
+            return
+        self._drive_enabled = True
+        self._holding = True
+        print_info("Drive ENABLED")
+
+    async def _fail_safe(self) -> None:
         """Stop the motors and disarm once the control link has gone quiet.
 
         The motors hold their last commanded RPM, so without this a laptop that
@@ -149,13 +161,28 @@ class VehicleController:
         of driving blind. Drive stays off until 'a' is pressed again, so a link
         that comes back with the stick still pushed does not lurch forward.
         """
-        print_warning(f"Control link lost for >{self.link_timeout:.1f}s - stopping motors")
         self._link_lost = True
-        self._drive_enabled = False
         # A held 'a' must be released and pressed again, not read as a fresh press.
         self._prev_a = True
+        if self._holding:
+            print_warning(f"Control link lost for >{self.link_timeout:.1f}s - stopping motors")
+        await self._let_go()
+
+    async def _brake(self) -> None:
+        """Apply hardware brake to all motors, then disable drive."""
+        print_warning("BRAKE")
+        try:
+            await self.bus.brake(self)
+        finally:
+            await self._let_go(stop=False)
+
+    async def _let_go(self, *, stop: bool = True) -> None:
+        """Drive off, and the bus released - with a stop unless `stop` is
+        False (after a brake, which already stopped them)."""
+        self._drive_enabled = False
+        self._holding = False
         self._current_rpm = 0.0
-        self._stop_motors()
+        await self.bus.release(self, stop=stop)
 
     @staticmethod
     def _compute_side_rpms(base_rpm: float, right_x: float) -> tuple[float, float]:
@@ -171,29 +198,6 @@ class VehicleController:
         left_rpm = max(-MAX_RPM, min(MAX_RPM, base_rpm + steer))
         right_rpm = max(-MAX_RPM, min(MAX_RPM, base_rpm - steer))
         return left_rpm, right_rpm
-
-    def _apply(self, left_rpm: float, right_rpm: float) -> None:
-        """Send RPM commands to all motors. Right-side motors are negated to match mounting direction."""
-        left = round(left_rpm)
-        right = round(right_rpm)
-        for motor_id in LEFT_SIDE:
-            self.motor.send_rpm(motor_id, rpm=left)
-        for motor_id in RIGHT_SIDE:
-            self.motor.send_rpm(motor_id, rpm=right * (-1))
-
-    def _brake(self) -> None:
-        """Apply hardware brake to all motors. No-op if already braked."""
-        if not self._braked:
-            print_warning("BRAKE")
-            for motor_id in LEFT_SIDE + RIGHT_SIDE:
-                self.motor.set_brake(motor_id)
-            self._current_rpm = 0.0
-            self._braked = True
-
-    def _stop_motors(self) -> None:
-        """Send rpm=0 to all motors. Called on shutdown."""
-        for motor_id in LEFT_SIDE + RIGHT_SIDE:
-            self.motor.send_rpm(motor_id, rpm=0)
 
     @staticmethod
     def _ramp_toward(current: float, target: float) -> float:

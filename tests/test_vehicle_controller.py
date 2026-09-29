@@ -5,6 +5,7 @@ import socket
 import time
 
 from apps.vehicle_control.vehicle_controller import VehicleController
+from conftest import settle
 from lib.gamepad.udp_receiver import ControllerStateProtocol, open_receiver, parse_packet
 from settings import LEFT_SIDE, RIGHT_SIDE
 
@@ -14,37 +15,24 @@ STOP = [(motor_id, 0) for motor_id in ALL_MOTORS]
 TIMEOUT = 0.1
 
 
-class FakeMotor:
-    """Records commands; `delay` makes each one hold the bus like a real motor."""
-
-    def __init__(self, delay: float = 0.0) -> None:
-        self.commands: list[tuple[int, object]] = []
-        self.delay = delay
-
-    def send_rpm(self, motor_id: int, rpm: int = 0) -> None:
-        time.sleep(self.delay)
-        self.commands.append((motor_id, rpm))
-
-    def set_brake(self, motor_id: int) -> None:
-        time.sleep(self.delay)
-        self.commands.append((motor_id, "brake"))
-
-
-def datagram(*, a: bool = False, left_y: float = 0.0) -> bytes:
+def datagram(*, a: bool = False, left_y: float = 0.0, lb: bool = False) -> bytes:
     buttons = {name: False for name in ("a", "b", "x", "y", "lb", "rb", "l", "r")}
     buttons["a"] = a
+    buttons["lb"] = lb
     axes = {"left_x": 0.0, "left_y": left_y, "right_x": 0.0, "right_y": 0.0}
     axes.update(trigger_left=False, trigger_right=False)
     return json.dumps({"timestamp": 0.0, "axes": axes, "buttons": buttons}).encode()
 
 
 class Rig:
-    """A controller running on a protocol a test feeds by hand - no socket."""
+    """A controller running on a protocol a test feeds by hand - no socket -
+    driving a real `MotorBus` over a fake motor."""
 
-    def __init__(self, motor: FakeMotor) -> None:
+    def __init__(self, bus, motor) -> None:
+        self.bus = bus
         self.motor = motor
         self.packets = ControllerStateProtocol()
-        self.controller = VehicleController(motor, link_timeout=TIMEOUT)
+        self.controller = VehicleController(bus, link_timeout=TIMEOUT)
 
     def send(self, **fields) -> None:
         self.packets.datagram_received(datagram(**fields), ("127.0.0.1", 9))
@@ -66,36 +54,33 @@ class Rig:
         await asyncio.sleep(seconds)
 
 
-async def settle(condition, timeout: float = 2.0) -> None:
-    async with asyncio.timeout(timeout):
-        while not condition():
-            await asyncio.sleep(0.002)
-
-
-def run(scenario, motor: FakeMotor | None = None) -> FakeMotor:
-    """Run `scenario(rig)` with the controller going; cancels it after."""
-    motor = motor or FakeMotor()
+def run(scenario, running_bus, delay: float = 0.0) -> list:
+    """Run `scenario(rig)` with the controller going; cancels it after, and
+    returns every command the motor got."""
+    commands: list = []
 
     async def main() -> None:
-        rig = Rig(motor)
-        task = asyncio.create_task(rig.controller.run(rig.packets))
-        try:
-            await scenario(rig)
-        finally:
-            task.cancel()
+        async with running_bus(delay=delay) as (bus, motors):
+            rig = Rig(bus, motors[0])
+            task = asyncio.create_task(rig.controller.run(rig.packets))
             try:
-                await task
-            except asyncio.CancelledError:
-                pass
+                await scenario(rig)
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                commands.extend(rig.motor.commands)
 
     asyncio.run(main())
-    return motor
+    return commands
 
 
 # -- link-drop stop ------------------------------------------------------------
 
 
-def test_silence_past_timeout_stops_all_motors() -> None:
+def test_silence_past_timeout_stops_all_motors(running_bus) -> None:
     async def scenario(rig):
         await rig.drive_forward()
         rig.motor.commands.clear()
@@ -104,11 +89,13 @@ def test_silence_past_timeout_stops_all_motors() -> None:
         assert rig.motor.commands == STOP
         assert rig.controller._drive_enabled is False
         assert rig.controller._current_rpm == 0.0
+        # And the bus is free for someone else.
+        assert rig.bus.holder_name is None
 
-    run(scenario)
+    run(scenario, running_bus)
 
 
-def test_short_gaps_do_not_stop() -> None:
+def test_short_gaps_do_not_stop(running_bus) -> None:
     async def scenario(rig):
         await rig.drive_forward()
         for _ in range(10):
@@ -119,10 +106,10 @@ def test_short_gaps_do_not_stop() -> None:
         assert rig.controller._drive_enabled is True
         assert rig.controller._current_rpm > 0
 
-    run(scenario)
+    run(scenario, running_bus)
 
 
-def test_stop_is_sent_once_per_outage() -> None:
+def test_stop_is_sent_once_per_outage(running_bus) -> None:
     async def scenario(rig):
         await rig.drive_forward()
         rig.motor.commands.clear()
@@ -130,18 +117,18 @@ def test_stop_is_sent_once_per_outage() -> None:
 
         assert rig.motor.commands == STOP
 
-    run(scenario)
+    run(scenario, running_bus)
 
 
-def test_no_failsafe_before_first_packet() -> None:
+def test_no_failsafe_before_first_packet(running_bus) -> None:
     async def scenario(rig):
         await rig.silence(TIMEOUT * 3)
         assert rig.motor.commands == []
 
-    run(scenario)
+    run(scenario, running_bus)
 
 
-def test_restored_link_stays_disarmed_until_a_is_pressed_again() -> None:
+def test_restored_link_stays_disarmed_until_a_is_pressed_again(running_bus) -> None:
     async def scenario(rig):
         await rig.drive_forward()
         await rig.silence(TIMEOUT * 1.5)
@@ -149,9 +136,10 @@ def test_restored_link_stays_disarmed_until_a_is_pressed_again() -> None:
         # Link returns with the stick still pushed and 'a' still held down.
         rig.motor.commands.clear()
         rig.send(a=True, left_y=-1.0)
-        await settle(lambda: rig.motor.commands)
+        await asyncio.sleep(0.02)
         assert rig.controller._drive_enabled is False
-        assert all(rpm == 0 for _, rpm in rig.motor.commands)
+        # Disarmed, it does not hold the bus, so it sends nothing at all.
+        assert rig.motor.commands == []
 
         # Release, then press: that is a deliberate re-arm.
         for a in (False, True):
@@ -159,24 +147,27 @@ def test_restored_link_stays_disarmed_until_a_is_pressed_again() -> None:
             rig.send(a=a)
         await settle(lambda: rig.controller._drive_enabled)
 
-    run(scenario)
+    run(scenario, running_bus)
 
 
-def test_second_outage_is_detected_after_recovery() -> None:
+def test_second_outage_is_detected_after_recovery(running_bus) -> None:
     async def scenario(rig):
         await rig.drive_forward()
         await rig.silence(TIMEOUT * 1.5)
-        rig.send()
-        await asyncio.sleep(0.01)
+        for a in (False, True):
+            await asyncio.sleep(0.01)
+            rig.send(a=a)
+        await settle(lambda: rig.controller._drive_enabled)
+        await rig.send_and_wait(left_y=-1.0)
 
         rig.motor.commands.clear()
         await rig.silence(TIMEOUT * 1.5)
         assert rig.motor.commands == STOP
 
-    run(scenario)
+    run(scenario, running_bus)
 
 
-def test_time_on_the_bus_counts_as_silence() -> None:
+def test_time_on_the_bus_counts_as_silence(running_bus) -> None:
     # The deadline runs from the last packet's arrival, not from when the loop
     # got round to waiting: a pass that held the bus has already used some.
     async def scenario(rig):
@@ -188,13 +179,70 @@ def test_time_on_the_bus_counts_as_silence() -> None:
         # One pass, then the stop - not a pass, a full timeout, and the stop.
         assert time.monotonic() - started < TIMEOUT * 2.5
 
-    run(scenario)
+    run(scenario, running_bus)
+
+
+# -- sharing the bus -------------------------------------------------------------
+
+
+def test_a_is_refused_while_someone_else_drives(running_bus) -> None:
+    async def scenario(rig):
+        page = object()
+        rig.bus.claim(page, "A viewer on the status page")
+
+        rig.send(a=True)
+        await asyncio.sleep(0.02)
+        rig.send(left_y=-1.0)
+        await asyncio.sleep(0.02)
+
+        assert rig.controller._drive_enabled is False
+        assert rig.motor.commands == []
+        assert rig.bus.holder_name == "A viewer on the status page"
+
+        # Once the page lets go, 'a' works.
+        await rig.bus.release(page)
+        for a in (False, True):
+            rig.send(a=a)
+            await asyncio.sleep(0.01)
+        await settle(lambda: rig.controller._drive_enabled)
+        assert rig.bus.holder_name == "The gamepad"
+
+    run(scenario, running_bus)
+
+
+def test_drive_off_ramps_down_then_lets_the_bus_go(running_bus) -> None:
+    async def scenario(rig):
+        await rig.drive_forward()
+        rig.send()
+        await asyncio.sleep(0.01)
+        await rig.send_and_wait(a=True)  # drive off
+        while rig.controller._current_rpm:
+            await rig.send_and_wait()
+
+        await settle(lambda: rig.bus.holder_name is None)
+        assert rig.motor.commands[-4:] == STOP
+
+    run(scenario, running_bus)
+
+
+def test_brake_brakes_and_lets_the_bus_go(running_bus) -> None:
+    async def scenario(rig):
+        await rig.drive_forward()
+        rig.motor.commands.clear()
+
+        await rig.send_and_wait(lb=True)
+
+        assert rig.motor.commands == [(motor_id, "brake") for motor_id in ALL_MOTORS]
+        assert rig.controller._drive_enabled is False
+        assert rig.bus.holder_name is None
+
+    run(scenario, running_bus)
 
 
 # -- the bus off the event loop ----------------------------------------------
 
 
-def test_packets_that_land_during_a_pass_collapse_to_the_newest() -> None:
+def test_packets_that_land_during_a_pass_collapse_to_the_newest(running_bus) -> None:
     async def scenario(rig):
         await rig.send_and_wait(a=True)
         rig.motor.delay = 0.01  # 40 ms a pass
@@ -208,7 +256,7 @@ def test_packets_that_land_during_a_pass_collapse_to_the_newest() -> None:
         # Two passes - the first, then the newest of the five - not six.
         assert len(rig.motor.commands) == 2 * len(ALL_MOTORS)
 
-    run(scenario)
+    run(scenario, running_bus)
 
 
 # What PYTHONASYNCIODEBUG=1 reports: any step over slow_callback_duration. The
@@ -219,7 +267,7 @@ def test_packets_that_land_during_a_pass_collapse_to_the_newest() -> None:
 SLOW_STEP = 0.2
 
 
-def slow_steps_while_driving(controller_factory=None, drive_packets: int = 6) -> list[str]:
+def slow_steps_while_driving(running_bus, on_the_loop=False, drive_packets: int = 6) -> list[str]:
     """Drive a few passes over a 100 ms-per-motor bus in debug mode, and
     return the slow-step warnings asyncio logged."""
     slow_steps: list[str] = []
@@ -230,21 +278,26 @@ def slow_steps_while_driving(controller_factory=None, drive_packets: int = 6) ->
                 slow_steps.append(record.getMessage())
 
     async def main() -> None:
-        asyncio.get_running_loop().slow_callback_duration = SLOW_STEP
-        rig = Rig(FakeMotor(delay=0.1))
-        if controller_factory is not None:
-            controller_factory(rig.controller)
-        task = asyncio.create_task(rig.controller.run(rig.packets))
-        rig.send(a=True)
-        for _ in range(drive_packets):
-            await asyncio.sleep(0.05)
-            rig.send(left_y=-1.0)
-        await settle(lambda: len(rig.motor.commands) >= 8)
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        async with running_bus(delay=0.1) as (bus, motors):
+            asyncio.get_running_loop().slow_callback_duration = SLOW_STEP
+            if on_the_loop:
+                # As before the bus had a thread: every call straight from the loop.
+                async def direct(call, *args, **kwargs):
+                    return call(*args, **kwargs)
+
+                bus._call = direct
+            rig = Rig(bus, motors[0])
+            task = asyncio.create_task(rig.controller.run(rig.packets))
+            rig.send(a=True)
+            for _ in range(drive_packets):
+                await asyncio.sleep(0.05)
+                rig.send(left_y=-1.0)
+            await settle(lambda: len(rig.motor.commands) >= 4)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     handler = Catch()
     logging.getLogger("asyncio").addHandler(handler)
@@ -255,36 +308,29 @@ def slow_steps_while_driving(controller_factory=None, drive_packets: int = 6) ->
     return slow_steps
 
 
-def test_a_slow_bus_never_stalls_the_event_loop() -> None:
-    assert slow_steps_while_driving() == []
+def test_a_slow_bus_never_stalls_the_event_loop(running_bus) -> None:
+    assert slow_steps_while_driving(running_bus) == []
 
 
-def test_the_stall_check_does_catch_a_bus_on_the_loop() -> None:
+def test_the_stall_check_does_catch_a_bus_on_the_loop(running_bus) -> None:
     # The control for the test above: with the bus called straight from the
-    # loop, as before the worker thread, the same run must be reported - or
-    # the threshold has drifted to where the check can no longer fail.
-    def on_the_loop(controller):
-        async def direct(action, *args):
-            action(*args)
-
-        controller._on_bus = direct
-
-    # One blocked pass is proof enough; six would only add seconds.
-    assert slow_steps_while_driving(on_the_loop, drive_packets=1) != []
+    # loop, the same run must be reported - or the threshold has drifted to
+    # where the check can no longer fail. One blocked pass is proof enough.
+    assert slow_steps_while_driving(running_bus, on_the_loop=True, drive_packets=1) != []
 
 
-def test_cancelling_mid_pass_still_ends_with_the_motors_stopped() -> None:
+def test_cancelling_mid_pass_still_ends_with_the_motors_stopped(running_bus) -> None:
     async def scenario(rig):
         await rig.drive_forward()
         rig.motor.delay = 0.02
         rig.send(left_y=-1.0)
         await asyncio.sleep(0.01)  # a pass is on the bus; the run() is cancelled now
 
-    motor = run(scenario)
-    # The pass finished first - a thread cannot be cancelled - and the stop,
-    # waiting on the bus lock, came after it rather than between its writes.
-    assert motor.commands[-len(ALL_MOTORS) :] == STOP
-    driving = motor.commands[-2 * len(ALL_MOTORS) : -len(ALL_MOTORS)]
+    commands = run(scenario, running_bus)
+    # The pass finished first - a thread cannot be cancelled - and the stop
+    # came after it rather than between its writes.
+    assert commands[-len(ALL_MOTORS) :] == STOP
+    driving = commands[-2 * len(ALL_MOTORS) : -len(ALL_MOTORS)]
     assert all(rpm != 0 for _, rpm in driving)
 
 
@@ -299,7 +345,7 @@ def test_bad_packets_are_dropped() -> None:
     assert parse_packet(json.dumps(extra).encode()) is None
 
 
-def test_a_bad_packet_is_not_a_sign_of_life() -> None:
+def test_a_bad_packet_is_not_a_sign_of_life(running_bus) -> None:
     async def scenario(rig):
         await rig.drive_forward()
         rig.motor.commands.clear()
@@ -308,7 +354,7 @@ def test_a_bad_packet_is_not_a_sign_of_life() -> None:
             rig.packets.datagram_received(b"garbage", ("127.0.0.1", 9))
         assert rig.motor.commands == STOP
 
-    run(scenario)
+    run(scenario, running_bus)
 
 
 def test_packets_arrive_over_a_real_socket() -> None:

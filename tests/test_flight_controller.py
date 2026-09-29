@@ -5,6 +5,7 @@ import time
 
 from apps.api.services.flight_controller import FlightControllerStream
 from apps.api.services.vehicle_status import VehicleStatusService
+from lib.ddsm115 import MotorBus
 
 # Real time, kept short.
 STALE = 0.15
@@ -354,10 +355,10 @@ def test_an_unconfigured_stream_opens_nothing() -> None:
 def test_the_service_snapshot_shows_the_stream() -> None:
     link = FakeLink()
     stream = make_stream(Factory(link))
-    service = VehicleStatusService(motor_device=None, flight_controller=stream)
+    service = VehicleStatusService(bus=MotorBus(device=None), flight_controller=stream)
 
     async def main() -> None:
-        await service.start_streams()
+        await stream.start()
         try:
             link.send(sys_status(voltage=12400), attitude(roll=0.0175))
             await settle(lambda: service.snapshot()["attitude"]["roll_deg"] == 1.0)
@@ -366,7 +367,7 @@ def test_the_service_snapshot_shows_the_stream() -> None:
             assert snapshot["components"]["flight_controller"]["connected"] is True
             assert snapshot["fc_device"] == "/dev/serial0"
         finally:
-            await service.stop_streams()
+            await stream.stop()
 
     asyncio.run(main())
     assert link.closed

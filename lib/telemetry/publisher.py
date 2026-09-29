@@ -204,6 +204,17 @@ class TelemetryPublisher:
             asyncio.create_task(self._drain_loop(), name="telemetry-drainer"),
         ]
 
+    async def run(self) -> None:
+        """`start`, then wait until cancelled, then `stop`. For the rover's
+        supervisor. Returns at once when telemetry is not configured."""
+        await self.start()
+        try:
+            # The loops catch their own errors, so this only ends by
+            # cancellation - or by a bug, which the supervisor restarts.
+            await asyncio.gather(*self._tasks)
+        finally:
+            await self.stop()
+
     async def stop(self) -> None:
         """
         Stop both tasks, then disconnect and close the spool.
@@ -222,8 +233,11 @@ class TelemetryPublisher:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         await self._disconnect()
-        if self._spool is not None:
-            await self._spool.close()
+        spool, self._spool = self._spool, None
+        # Reopened on the next start; a restart after a crash is one.
+        self._spool_built = False
+        if spool is not None:
+            await spool.close()
 
     def message(self, snapshot: dict[str, Any], trigger: str = "change") -> dict[str, Any]:
         """

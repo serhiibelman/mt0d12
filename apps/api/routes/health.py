@@ -7,7 +7,7 @@ router = APIRouter()
 
 
 @router.get("/health", response_model=VehicleHealthResponse)
-def health(service: VehicleStatusServiceDep) -> VehicleHealthResponse:
+async def health(service: VehicleStatusServiceDep) -> VehicleHealthResponse:
     snapshot = service.snapshot()
     return VehicleHealthResponse(
         status=snapshot["overall_status"],

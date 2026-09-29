@@ -1,4 +1,6 @@
-import threading
+import asyncio
+import contextlib
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -6,6 +8,36 @@ import pytest
 from apps.api.main import create_app
 from apps.api.schemas import VehicleStatusResponse
 from apps.api.services.status_broadcaster import StatusBroadcaster
+from lib.ddsm115 import MotorBus
+
+
+class FakeMotorBus:
+    """The rover's one motor bus: who holds it, and what they sent."""
+
+    def __init__(self) -> None:
+        self.device = "/dev/ttyACM0"
+        self.holder: object | None = None
+        self.commands: list[tuple[int, int]] = []
+        self.releases = 0
+        self.error: str | None = None
+
+    def claim(self, owner: object, name: str) -> None:
+        if self.holder is not None and self.holder is not owner:
+            raise RuntimeError(f"{self.holder_name} is driving")
+        self.holder, self.holder_name = owner, name
+
+    async def release(self, owner: object, *, stop: bool = True) -> None:
+        if self.holder is None or owner is not self.holder:
+            return
+        self.holder = None
+        self.releases += 1
+
+    async def drive(self, owner: object, left_rpm: int, right_rpm: int) -> None:
+        if owner is not self.holder:
+            return
+        if self.error is not None:
+            raise RuntimeError(self.error)
+        self.commands.append((left_rpm, right_rpm))
 
 
 class FakeVehicleStatusService:
@@ -14,26 +46,9 @@ class FakeVehicleStatusService:
         self.stop_calls = 0
         # Settable so a test can watch a change arrive over /ws/status.
         self.voltage = 12.4
-        # Driving: the route calls these from worker threads.
-        self.drive_owner: object | None = None
-        self.drive_commands: list[tuple[int, int]] = []
-        self.drive_closes = 0
-        self.drive_error: str | None = None
-        self._drive_lock = threading.Lock()
+        self.bus = FakeMotorBus()
 
-    def start(self) -> None:
-        return None
-
-    def stop(self) -> None:
-        return None
-
-    async def start_streams(self) -> None:
-        return None
-
-    async def stop_streams(self) -> None:
-        return None
-
-    def start_motors(self, rpm: int) -> dict:
+    async def start_motors(self, rpm: int) -> dict:
         self.started_rpms.append(rpm)
         now = datetime.now(timezone.utc)
         return {
@@ -45,7 +60,7 @@ class FakeVehicleStatusService:
             "timestamp": now,
         }
 
-    def stop_motors(self) -> dict:
+    async def stop_motors(self) -> dict:
         self.stop_calls += 1
         now = datetime.now(timezone.utc)
         return {
@@ -56,27 +71,6 @@ class FakeVehicleStatusService:
             "detail": "All motors ramped down to 0 rpm",
             "timestamp": now,
         }
-
-    def open_drive(self, owner: object) -> None:
-        with self._drive_lock:
-            if self.drive_owner is not None:
-                raise RuntimeError("Another viewer is driving")
-            self.drive_owner = owner
-
-    def drive(self, owner: object, left_rpm: int, right_rpm: int) -> None:
-        with self._drive_lock:
-            if owner is not self.drive_owner:
-                return
-            if self.drive_error is not None:
-                raise RuntimeError(self.drive_error)
-            self.drive_commands.append((left_rpm, right_rpm))
-
-    def close_drive(self, owner: object | None = None) -> None:
-        with self._drive_lock:
-            if self.drive_owner is None or (owner is not None and owner is not self.drive_owner):
-                return
-            self.drive_owner = None
-            self.drive_closes += 1
 
     def snapshot(self) -> dict:
         now = datetime.now(timezone.utc)
@@ -140,23 +134,23 @@ class FakeCameraService:
         if not self.available:
             raise RuntimeError("Camera is unavailable: no camera detected")
 
-    def start(self) -> dict:
+    async def start(self) -> dict:
         self._guard()
         self.start_calls += 1
         return self._command("start", "Camera capture is running", running=True)
 
-    def stop(self) -> dict:
+    async def stop(self) -> dict:
         self.stop_calls += 1
         return self._command("stop", "Camera capture stopped", running=False)
 
     def preload(self) -> None:
         pass
 
-    def acquire_client_slot(self) -> None:
+    async def acquire_client_slot(self) -> None:
         self._guard()
         self.slots += 1
 
-    def release_client_slot(self) -> None:
+    async def release_client_slot(self) -> None:
         self.slots -= 1
 
     async def next_frame(self, last_seq: int):
@@ -166,7 +160,7 @@ class FakeCameraService:
             return None
         return next_seq, frames[next_seq]
 
-    def capture_frame(self) -> bytes:
+    async def capture_frame(self) -> bytes:
         self._guard()
         return b"jpeg-bytes"
 
@@ -234,3 +228,76 @@ def build_app(vehicle_service, camera_service):
         )
 
     return _build
+
+
+# -- a real MotorBus over fake motors ------------------------------------------
+
+
+class FakeMotor:
+    """A DDS115 on the far end of the port: records commands, can hold the bus
+    for `delay` per command like a real motor, and can fail like a pulled
+    cable."""
+
+    def __init__(self, device: str, delay: float = 0.0) -> None:
+        self.device = device
+        self.delay = delay
+        self.commands: list[tuple[int, object]] = []
+        self.closed = False
+        self.error: Exception | None = None
+
+    def send_rpm(self, motor_id: int, rpm: int = 0) -> None:
+        self._command(motor_id, rpm)
+
+    def set_brake(self, motor_id: int) -> None:
+        self._command(motor_id, "brake")
+
+    def _command(self, motor_id: int, value: object) -> None:
+        if self.error is not None:
+            raise self.error
+        time.sleep(self.delay)
+        self.commands.append((motor_id, value))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+async def settle(condition, timeout: float = 2.0) -> None:
+    async with asyncio.timeout(timeout):
+        while not condition():
+            await asyncio.sleep(0.002)
+
+
+@pytest.fixture()
+def running_bus():
+    """`async with running_bus() as (bus, motors)`: a MotorBus with its port
+    open, over fake motors - one per open, newest last."""
+
+    @contextlib.asynccontextmanager
+    async def _running(delay: float = 0.0, **kwargs):
+        motors: list[FakeMotor] = []
+
+        def factory(*, device: str) -> FakeMotor:
+            motor = FakeMotor(device, delay)
+            motors.append(motor)
+            return motor
+
+        options = {
+            "device": "/dev/test",
+            "motor_factory": factory,
+            "device_present": lambda _: True,
+            "check_interval": 0.01,
+            "backoff_min": 0.01,
+            "backoff_max": 0.02,
+            **kwargs,
+        }
+        bus = MotorBus(**options)
+        task = asyncio.create_task(bus.run())
+        try:
+            await settle(lambda: bus.is_open)
+            yield bus, motors
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    return _running

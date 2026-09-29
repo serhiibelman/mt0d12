@@ -1,13 +1,14 @@
-"""What the flight controller actually says on the rover's MAVLink port.
+"""
+What the flight controller actually says on the rover's MAVLink port.
 
-Run on the Pi from the project root, with the API stopped:
+Run on the Pi from the project root, with the rover stopped:
 
     python fc_survey.py                 # FC_DEVICE / FC_BAUDRATE from settings
     python fc_survey.py --seconds 30    # a longer listen, for slow messages
     python fc_survey.py --listen-only   # send nothing to the FC at all
 
-The API holds the same UART open; two readers on one serial port split the
-bytes between them, so both see broken frames. Stop the API first.
+The rover holds the same UART open; two readers on one serial port split the
+bytes between them, so both see broken frames. Stop the rover first.
 
 Three parts, in this order so the requests cannot skew the counts:
 
@@ -274,7 +275,7 @@ def main() -> int:
         print_error("No device: set FC_DEVICE or pass --device")
         return 1
 
-    print_warning("The API must be stopped: it reads this same port.")
+    print_warning("The rover must be stopped: it reads this same port.")
     print_info(f"Opening {args.device} at {args.baud} baud")
     try:
         link = mavutil.mavlink_connection(args.device, baud=args.baud)

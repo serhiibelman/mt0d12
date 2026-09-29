@@ -11,19 +11,21 @@ a separate task applies it when the bus is free - newest wins, the rule
 `StatusBroadcaster` applies to updates - and the rover never works through a
 backlog of positions the driver has already moved on from.
 
-The bus calls block, so they run in a worker thread. A thread cannot be
-cancelled; a cancelled session stops waiting for one, but the call itself
-still finishes, which is what makes the stop on the way out reliable.
+The session drives through the rover's one `MotorBus`, the same one the
+gamepad and the /motors ramps use: arming claims it, disarming releases it,
+which stops the motors. Only one of them holds it at a time. The bus runs its
+calls on its own thread and never drops one it was handed, which is what makes
+the stop on the way out reliable, however the session ends.
 """
 
 import asyncio
-import contextlib
 import logging
 import math
 from collections.abc import Awaitable, Callable
-from typing import Any, Protocol
+from typing import Any
 
 from apps.vehicle_control.vehicle_controller import DEAD_ZONE, MAX_RPM, VehicleController
+from lib.ddsm115 import MotorBus
 
 logger = logging.getLogger(__name__)
 
@@ -31,15 +33,8 @@ logger = logging.getLogger(__name__)
 # "type" field, which is how the page tells the two apart.
 Notify = Callable[[dict[str, Any]], Awaitable[None]]
 
-
-class MotorBus(Protocol):
-    """The part of `VehicleStatusService` a session drives through."""
-
-    def open_drive(self, owner: object) -> None: ...
-
-    def drive(self, owner: object, left_rpm: int, right_rpm: int) -> None: ...
-
-    def close_drive(self, owner: object | None = None) -> None: ...
+# Who holds the bus, in what another driver is told: "... is driving".
+DRIVER = "A viewer on the status page"
 
 
 def drive_state(armed: bool, detail: str) -> dict[str, Any]:
@@ -63,15 +58,14 @@ class DriveSession:
     def __init__(self, bus: MotorBus, notify: Notify) -> None:
         self._bus = bus
         self._notify = notify
-        # Arming and disarming each wait on the bus; the lock keeps one from
-        # starting while the other is still under way.
+        # Disarming waits on the bus for the stop; the lock keeps an arm from
+        # slipping in while it is still under way.
         self._lock = asyncio.Lock()
         self._armed = False
         self._throttle = 0.0
         self._steer = 0.0
         self._current_rpm = 0.0
         self._changed = asyncio.Event()
-        self._opening: asyncio.Future[None] | None = None
 
     @property
     def armed(self) -> bool:
@@ -81,12 +75,10 @@ class DriveSession:
         async with self._lock:
             if self._armed:
                 return
-            # Shielded, and kept, because a thread cannot be cancelled: if the
-            # connection ends mid-open the port may still open after it, and
-            # `close` has to wait for that before it can release it.
-            self._opening = asyncio.ensure_future(asyncio.to_thread(self._bus.open_drive, self))
+            # The port is already open - the bus holds it for the whole run -
+            # so arming waits on nothing.
             try:
-                await asyncio.shield(self._opening)
+                self._bus.claim(self, DRIVER)
             except RuntimeError as exc:
                 await self._notify(drive_state(False, str(exc)))
                 return
@@ -105,18 +97,15 @@ class DriveSession:
             if not self._armed:
                 return
             self._armed = False
-            await self._close_bus()
+            await self._bus.release(self)
         await self._notify(drive_state(False, detail))
 
     async def close(self) -> None:
         """Stop and release without telling the page, which may be gone. For
         the end of the connection, however it ended."""
         self._armed = False
-        if self._opening is not None:
-            with contextlib.suppress(Exception):
-                await self._opening
         # Owner-checked, so a no-op unless this session holds the bus.
-        await self._close_bus()
+        await self._bus.release(self)
 
     def command(self, throttle: float, steer: float) -> None:
         """Record the newest stick position; `run_motors` applies it."""
@@ -139,15 +128,7 @@ class DriveSession:
             self._current_rpm = VehicleController._ramp_toward(self._current_rpm, target)
             left, right = VehicleController._compute_side_rpms(self._current_rpm, self._steer)
             try:
-                await asyncio.to_thread(self._bus.drive, self, round(left), round(right))
+                await self._bus.drive(self, round(left), round(right))
             except RuntimeError as exc:
                 logger.warning("Drive command failed: %s", exc)
                 await self.disarm(f"Motor bus failed: {exc}")
-
-    async def _close_bus(self) -> None:
-        try:
-            await asyncio.to_thread(self._bus.close_drive, self)
-        except Exception:
-            # Nothing more can be done from here; the motors keep their last
-            # command, so this must at least be loud.
-            logger.exception("Could not stop the motors")

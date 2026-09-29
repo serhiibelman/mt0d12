@@ -3,10 +3,9 @@
 Work that is understood but not done. Each item says why it matters and where
 it lands, so picking one up does not mean rediscovering the problem.
 
-Items 1-3 are an async-programming track and come first by choice: practice
-on real code, with each step also moving the rover toward being driven from a
-browser. Everything after them is ordered by what hurts most if it stays
-undone, not by effort.
+Items 1-2 are what is left of an async-programming track, and come first by
+choice: practice on real code. Everything after them is ordered by what hurts
+most if it stays undone, not by effort.
 
 Repos: `mt0d12` (this one, the vehicle) and `mt0d12-infrastructure` (AWS).
 
@@ -14,13 +13,14 @@ Repos: `mt0d12` (this one, the vehicle) and `mt0d12-infrastructure` (AWS).
 
 ## Async track
 
-The gamepad control loop, the flight controller reader and the telemetry
-publisher run on asyncio now. Still on threads: the status probe (motor bus and
-Pi health) and the camera. Every item below builds on that, in order of risk -
-no new hardware until 2. Python 3.11+ (`TaskGroup`,
-`asyncio.timeout`); the Pi's venv is 3.12. Build and test on the laptop with
-fakes first - the suite already fakes motors, the FC link and clocks, and
-`pytest-asyncio` extends that to coroutines.
+The whole rover is one asyncio process now (`apps/rover`, see
+`docs/one-process.md`): the motor bus, the FC reader, the probe, the camera,
+telemetry, the gamepad link and the web server are tasks on one event loop
+under a supervisor. The only threads left are the ones a blocking library
+needs - the bus's own, pymavlink's reads, picamera2's encoder. The items below
+build on that. Python 3.11+ (`TaskGroup`, `asyncio.timeout`); the Pi's venv is
+3.12. Build and test on the laptop with fakes first - the suite already fakes
+motors, the FC link and clocks.
 
 ### 1. Base station: a local broker and a recorder
 
@@ -50,32 +50,21 @@ changing - the station connecting in to the rover does not.
 
 ### 2. Ultrasonic sensors: threads into the event loop
 
-**Where:** new `lib/` sensor module, `apps/vehicle_control/` · **Size:** M ·
+**Where:** new `lib/` sensor module, a task in `apps/rover/` · **Size:** M ·
 **Needs:** 2-3 HC-SR04P
 
 pigpio reports echoes by calling back on its own thread. Getting those readings
 into the loop safely - `loop.call_soon_threadsafe()`, never touching loop state
 from the callback - is the classic bug source this item is for. The payoff is
-an obstacle stop, and the distance data any later mapping needs. pigpio is
-public domain, `gpiozero` BSD. Power the HC-SR04P from 3.3V so its echo is
-safe for the Pi's GPIO without a divider.
-
-### 3. One async process runs everything
-
-**Where:** new `apps/rover/` · **Size:** L
-
-A single asyncio program owning the control loop, sensors, FC reader, telemetry
-and the API, under a supervisor that restarts a task that crashes. Teaches
-structured concurrency across a whole application, priorities (driving never
-waits for telemetry) and shutdown order.
-
-Also the architectural fix: today the API and `vehicle_control` both open the
-motor serial port and whichever starts second gets a 503, and telemetry only
-publishes while the API runs. One process owning the bus ends both.
+an obstacle stop, and the distance data any later mapping needs. The stop
+belongs in one place now - `MotorBus.halt` or a refusal in `drive` - and
+covers the page, the gamepad and the ramps at once. pigpio is public domain,
+`gpiozero` BSD. Power the HC-SR04P from 3.3V so its echo is safe for the Pi's
+GPIO without a divider.
 
 ---
 
-## 4. Last Will and Testament
+## 3. Last Will and Testament
 
 **Where:** `lib/telemetry/publisher.py` (`_AiomqttConnection.connect`) · **Size:** XS
 
@@ -88,7 +77,7 @@ which with the 300s idle interval means up to five minutes of ambiguity.
 plus publishing `online` after connect. Retained, so anything subscribing later
 sees current state immediately.
 
-## 5. Scope the IoT policy
+## 4. Scope the IoT policy
 
 **Where:** `mt0d12-infrastructure/terraform/iot.tf` · **Size:** S
 
@@ -152,22 +141,18 @@ that would hurt to lose.
 
 ## Housekeeping
 
-- **`start_api.sh` venv mismatch** - sources `.venv-3.12`, the README uses
-  `venv`. Whichever is right, they should agree.
-- **Telemetry only publishes from the API process.** `start_vehicle.sh` runs
-  `apps.vehicle_control.main`, which has no publisher, so driving without the
-  API sends nothing. Either document it or move the publisher.
+- **`start_*.sh` venv mismatch** - the scripts source `.venv-3.12`, the README
+  uses `venv`. Whichever is right, they should agree.
 - **Lambda logs nothing on success,** so "it worked" is inferred from the
   absence of a traceback.
-- **uvicorn hangs on shutdown while a WebSocket viewer is connected.** On
-  Python 3.12+ (the Pi's venv), uvicorn 0.22 awaits `server.wait_closed()`,
-  which now waits for open connections, before it closes them - so SIGTERM
-  never finishes while the status page is open, and only SIGKILL stops it.
-  uvicorn 0.54 orders these correctly and ships a sans-I/O implementation on
-  the current websockets API, so the `websockets==13.1` pin and its comment can
-  go too. Both are pure-Python wheels that install on armv6. Check on the Pi:
-  the install, startup time and memory on 512 MB, and a clean SIGTERM with the
-  page open.
+- **uvicorn 0.22.** It awaits `server.wait_closed()` before closing open
+  connections, which on Python 3.12+ waits for them - an open status page used
+  to hold SIGTERM up forever. `ApiServer.stop` now closes them first, so this
+  no longer bites. Upgrading is still worth it: uvicorn 0.54 orders these
+  correctly and ships a sans-I/O implementation on the current websockets API,
+  so the `websockets==13.1` pin and its comment can go too. Both are
+  pure-Python wheels that install on armv6. Check on the Pi: the install,
+  startup time and memory on 512 MB.
 
 ---
 
@@ -187,26 +172,27 @@ the same check.
 
 ### Stop on tilt
 
-**Where:** `apps/api/services/drive.py`, `apps/vehicle_control/` · **Size:** S
+**Where:** a task in `apps/rover/`, `lib/ddsm115/bus.py` · **Size:** S
 
 Attitude already arrives from the FC; past a roll or pitch limit the motors
-should stop, rather than keep spinning with the rover on its side. Both drive
-paths need it - the page and the gamepad. The first consumer of the "new FC
+should stop, rather than keep spinning with the rover on its side. One task
+watching the FC stream and stopping through the bus covers every driver - the
+page, the gamepad and the ramps. The first consumer of the "new FC
 reading" event `docs/fc-stream.md` deferred.
 
 ### Battery-aware limits
 
-**Where:** `apps/api/services/drive.py`, `apps/vehicle_control/` · **Size:** S
+**Where:** `lib/ddsm115/bus.py`, `apps/api/services/drive.py`, `apps/vehicle_control/` · **Size:** S
 
 Scale `MAX_RPM` down as the voltage sags and refuse to arm below a critical
 level, so the rover does not brown out mid-drive or run the pack flat.
 
 ### Motor feedback
 
-**Where:** `lib/ddsm115/`, `apps/api/services/vehicle_status.py` · **Size:** M
+**Where:** `lib/ddsm115/bus.py` (`feedback`) · **Size:** M
 
-Every DDSM115 reply carries speed, current and position, and only the current
-is kept today. Real per-wheel RPM and current on the page; a stall - high
+Every DDSM115 reply carries speed, current and position, and the bus throws
+them away: `motor_feedback` shows the commanded RPM. Real per-wheel RPM and current on the page; a stall - high
 current, near-zero speed - stops the drive before a motor cooks; wheel
 positions give odometry, which the ultrasonic sensors' mapping will want.
 

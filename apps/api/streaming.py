@@ -1,4 +1,5 @@
-"""Plumbing for routes that stream to a viewer until they leave.
+"""
+Plumbing for routes that stream to a viewer until they leave.
 
 A route decides what to stream; the functions here do the sending and notice
 the viewer going away, so the route itself stays a few lines long.
@@ -28,7 +29,8 @@ STALL_GRACE = 0.05
 
 
 def locked_sender(websocket: WebSocket) -> Callable[[str], Awaitable[None]]:
-    """`send_text`, one message at a time.
+    """
+    `send_text`, one message at a time.
 
     Status and drive state go out from different tasks. One frame is one write
     today, but nothing promises that, and two frames interleaved would be one
@@ -50,12 +52,13 @@ async def serve_until_disconnect(
     session: DriveSession,
     link_timeout: float,
 ) -> None:
-    """Status out, drive commands in, until the viewer disconnects.
+    """
+    Status out, drive commands in, until the viewer disconnects.
 
     Three things wait at once - the next update, the next command and a free
     motor bus - so each gets a task, under a TaskGroup: when any ends with an
     exception the group cancels the others. The disconnect ends it quietly;
-    anything else, such as a send that failed for a real reason, propagates.
+    anything else, such as send that failed for a real reason, propagates.
     Either way the caller's `DriveSession.close` stops the motors after.
     """
     try:
@@ -73,7 +76,8 @@ async def _forward(send: Callable[[str], Awaitable[None]], updates: asyncio.Queu
 
 
 async def _read_commands(websocket: WebSocket, session: DriveSession, link_timeout: float) -> None:
-    """Read commands until the viewer disconnects, and stop on silence.
+    """
+    Read commands until the viewer disconnects, and stop on silence.
 
     A closing browser sends a disconnect message, and listening is how it is
     noticed at once rather than on the next failed send. A viewer that is only
@@ -98,7 +102,8 @@ async def _read_commands(websocket: WebSocket, session: DriveSession, link_timeo
 
 
 async def _already_arrived(websocket: WebSocket) -> dict[str, Any] | None:
-    """A command that came in while this process was too busy to read it.
+    """
+    A command that came in while this process was too busy to read it.
 
     When the event loop stalls - the camera opening takes the Pi 1's only core
     for a second or more - the timeout and the commands queued behind it come
@@ -142,7 +147,8 @@ async def _handle_command(session: DriveSession, command: dict[str, Any] | None)
 
 
 async def mjpeg_parts(service: CameraService) -> AsyncIterator[bytes]:
-    """Yield MJPEG parts until the camera stops.
+    """
+    Yield MJPEG parts until the camera stops.
 
     The wait for a frame is a coroutine, so a viewer costs the event loop
     nothing between frames and holds no worker thread. A viewer leaving is

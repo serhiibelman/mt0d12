@@ -1,10 +1,11 @@
 ## 0. Project layout
 
 ```
-apps/                  processes - each one is started by a start_*.sh
-├── api/               FastAPI service on the vehicle
-├── vehicle_control/   motor loop on the vehicle
-└── controller/        gamepad reader on the laptop
+apps/                  what runs - started by a start_*.sh
+├── rover/             the one process on the vehicle: runs everything below
+├── api/               its web side: routes, status page, services
+├── vehicle_control/   its gamepad side: the UDP control loop
+└── controller/        gamepad reader on the laptop (its own process)
 lib/                   libraries - imported, never started
 ├── ddsm115/           motor driver
 ├── gamepad/           UDP control protocol shared by controller and vehicle
@@ -16,8 +17,9 @@ tests/
 ```
 
 The rule is one-directional: `apps/*` may import `lib/*`, and `lib/*` never
-imports `apps/*`. A package under `apps/` owns a process; anything two
-processes need lives in `lib/`.
+imports `apps/*`. `apps/rover` owns the vehicle's process and wires `api` and
+`vehicle_control` together; anything two of them share, such as the motor bus
+(`lib/ddsm115/bus.py`), lives in `lib/`.
 
 ## 1. Install system dependencies
 
@@ -39,13 +41,21 @@ source ~/mt0d12/venv/bin/activate
 pip install -r ~/mt0d12/requirements.txt
 ```
 
-## 4. Start vehicle API
+## 4. Start the rover
 
 Run on the vehicle:
 
 ```
-uvicorn apps.api.main:app --host 0.0.0.0 --port 8000
+./start_rover.sh          # or: python -m apps.rover.main
 ```
+
+One asyncio process runs everything: the motor bus, the flight controller
+link, the Pi probe, the camera, telemetry, the gamepad link (UDP 5005) and the
+web server (port 8000). Each part is a task under a supervisor that restarts
+it if it crashes, so a bug in one costs that part, not the driving. SIGTERM or
+Ctrl+C stops the motors first, then everything else in order, and returns in
+a second or two even with a status page open. Why it is built this way:
+[docs/one-process.md](docs/one-process.md).
 
 Open `http://<vehicle-host>:8000/` in a browser for the status page: battery, attitude,
 components and Pi health, live over `/ws/status`. It needs nothing but the Pi, so it works
@@ -89,8 +99,15 @@ Notes:
 
 1. The API is intended to run on the vehicle itself so it can probe local hardware directly.
 2. Motor start accepts values in the same range used by the controller logic: `-200` to `200`.
-3. The motor endpoints ramp in controller-sized steps instead of jumping to the target immediately.
-4. If another process already owns the motor or FC serial port, the API will report that component as unavailable and motor commands can fail with `503`.
+3. The motor endpoints ramp in controller-sized steps instead of jumping to the target immediately,
+   and leave the motors turning after.
+4. The status page, the gamepad and `/motors/start` share one motor bus, one at a time. While one
+   of them drives, the others are refused: `503` with "The gamepad is driving" or similar.
+5. The motor port stays open for the whole run. If it goes - a command fails, or the USB adapter
+   disappears while idle - `motor_bus.detail` says why and it is reopened with backoff, 0.5s
+   doubling to 10s.
+6. If another process already owns the FC serial port (`fc_survey.py`, say), the flight controller
+   reads as unavailable.
 
 
 ## 5. Camera stream
@@ -126,7 +143,7 @@ curl -X POST http://<vehicle-host>:8000/camera/stop
 Notes:
 
 1. The camera opens on the first `/camera/stream` or `/camera/snapshot` request, and
-   closes again two seconds after the last stream viewer leaves, so the sensor stays
+   closes again two seconds after the last viewer or snapshot is done, so the sensor stays
    powered down while nobody is watching. `POST /camera/start` warms it up ahead of time
    and `POST /camera/stop` releases it. The status page opens the stream when you press
    Arm and drops it on Stop, so video runs exactly while the motors do.
@@ -269,7 +286,7 @@ See `docs/gamepad-control.md` for the operator flow and control mapping.
 
 Quick start:
 
-1. On the Raspberry Pi, run `./start_vehicle.sh`.
+1. On the Raspberry Pi, run `./start_rover.sh`.
 2. On the laptop with the gamepad connected, run `./start_controller.sh`.
 3. Use the controls from the gamepad doc to enable drive and move the vehicle.
 
@@ -280,4 +297,4 @@ Quick start:
 sudo ssh pi@192.168.0.105
 ``
 2. on laptop side run ./start_controller.sh
-3. on raspberry side run ./start_vehicle.sh
+3. on raspberry side run ./start_rover.sh

@@ -8,12 +8,13 @@ CI) the ones that do not exist come back as None rather than failing.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -42,14 +43,29 @@ DISK_LOW_PERCENT = 10
 MEMORY_LOW_PERCENT = 10
 
 
-def _run_vcgencmd() -> str:
-    return subprocess.run(
-        ["vcgencmd", "get_throttled"],
-        capture_output=True,
-        text=True,
-        timeout=VCGENCMD_TIMEOUT_SECONDS,
-        check=True,
-    ).stdout
+async def _run_vcgencmd() -> str:
+    """`vcgencmd get_throttled`, as a subprocess the event loop waits on.
+
+    A firmware call that hangs is killed at the timeout rather than left
+    holding a worker thread.
+    """
+    process = await asyncio.create_subprocess_exec(
+        "vcgencmd",
+        "get_throttled",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        async with asyncio.timeout(VCGENCMD_TIMEOUT_SECONDS):
+            stdout, _ = await process.communicate()
+    except BaseException:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise
+    if process.returncode:
+        raise subprocess.CalledProcessError(process.returncode, "vcgencmd")
+    return stdout.decode()
 
 
 def parse_throttled(text: str) -> int:
@@ -108,8 +124,8 @@ def warnings_for(health: dict[str, Any]) -> list[str]:
 
 
 class PiHealthReader:
-    """Reads the board's health. Callable, so the status service can take any
-    zero-argument function in its place under test."""
+    """Reads the board's health. Awaitable-callable, so the status service can
+    take any zero-argument coroutine function in its place under test."""
 
     def __init__(
         self,
@@ -118,7 +134,7 @@ class PiHealthReader:
         meminfo_path: Path = MEMINFO_PATH,
         throttled_path: Path = THROTTLED_SYSFS_PATH,
         disk_path: str = "/",
-        run_vcgencmd: Callable[[], str] = _run_vcgencmd,
+        run_vcgencmd: Callable[[], Awaitable[str]] = _run_vcgencmd,
         loadavg: Callable[[], tuple[float, float, float]] = os.getloadavg,
     ) -> None:
         self.thermal_path = thermal_path
@@ -131,13 +147,13 @@ class PiHealthReader:
         # fails every probe, and a failed spawn still costs a fork.
         self._vcgencmd_missing = False
 
-    def __call__(self) -> dict[str, Any]:
+    async def __call__(self) -> dict[str, Any]:
         health = {
             "cpu_temp_c": self._cpu_temp(),
             "load_1m": self._load(),
             **self._memory(),
             **self._disk(),
-            **throttle_flags(self._throttle_word()),
+            **throttle_flags(await self._throttle_word()),
         }
         health["warnings"] = warnings_for(health)
         return health
@@ -181,7 +197,7 @@ class PiHealthReader:
             "disk_free_percent": round(usage.free * 100 / usage.total) if usage.total else None,
         }
 
-    def _throttle_word(self) -> int | None:
+    async def _throttle_word(self) -> int | None:
         try:
             return parse_throttled(self.throttled_path.read_text())
         except (OSError, ValueError):
@@ -189,9 +205,9 @@ class PiHealthReader:
         if self._vcgencmd_missing:
             return None
         try:
-            return parse_throttled(self._run_vcgencmd())
+            return parse_throttled(await self._run_vcgencmd())
         except FileNotFoundError:
             self._vcgencmd_missing = True
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
+        except (OSError, ValueError, TimeoutError, subprocess.SubprocessError) as error:
             logger.debug("vcgencmd get_throttled failed", exc_info=error)
         return None

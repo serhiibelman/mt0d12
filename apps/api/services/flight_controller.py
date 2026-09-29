@@ -78,8 +78,7 @@ def attitude_from(message: Any) -> dict[str, Any]:
 @dataclass(frozen=True)
 class FcReading:
     """Everything the snapshot shows about the FC, replaced whole on every
-    change. One reference swap is atomic, so readers on other threads - the
-    probe, /status in the threadpool, telemetry - need no lock."""
+    change, so no reader ever sees half an update."""
 
     component: ComponentSnapshot
     battery: dict[str, Any]
@@ -119,6 +118,12 @@ class FlightControllerStream:
 
     def reading(self) -> FcReading:
         return self._reading
+
+    async def run(self) -> None:
+        """Stream until cancelled, closing the link on the way out. For the
+        rover's supervisor; `start` and `stop` run the same as a task."""
+        if self.device:
+            await self._run()
 
     async def start(self) -> None:
         if self.device and self._task is None:

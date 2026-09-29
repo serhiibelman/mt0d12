@@ -1,6 +1,4 @@
 import asyncio
-import threading
-
 import json
 import time
 
@@ -15,24 +13,24 @@ class FakeBus:
         self.owner: object | None = None
         self.commands: list[tuple[int, int]] = []
         self.closes = 0
-        self.fail_open: str | None = None
+        self.fail_claim: str | None = None
         self.fail_drive: str | None = None
-        self.gate = threading.Event()
+        self.gate = asyncio.Event()
         self.gate.set()
 
-    def open_drive(self, owner: object) -> None:
-        if self.fail_open:
-            raise RuntimeError(self.fail_open)
+    def claim(self, owner: object, name: str) -> None:
+        if self.fail_claim:
+            raise RuntimeError(self.fail_claim)
         self.owner = owner
 
-    def drive(self, owner: object, left_rpm: int, right_rpm: int) -> None:
-        self.gate.wait()
+    async def drive(self, owner: object, left_rpm: int, right_rpm: int) -> None:
+        await self.gate.wait()
         if self.fail_drive:
             raise RuntimeError(self.fail_drive)
         if owner is self.owner:
             self.commands.append((left_rpm, right_rpm))
 
-    def close_drive(self, owner: object | None = None) -> None:
+    async def release(self, owner: object, *, stop: bool = True) -> None:
         if self.owner is not None and owner is self.owner:
             self.owner = None
             self.closes += 1
@@ -152,10 +150,10 @@ def test_rearming_starts_from_standstill() -> None:
 
 def test_a_refused_arm_says_why() -> None:
     async def scenario(session, bus, notes):
-        bus.fail_open = "Another viewer is driving"
+        bus.fail_claim = "The gamepad is driving"
         await session.arm()
         assert session.armed is False
-        assert notes == [{"type": "drive", "armed": False, "detail": "Another viewer is driving"}]
+        assert notes == [{"type": "drive", "armed": False, "detail": "The gamepad is driving"}]
 
     run_session(scenario)
 
@@ -172,32 +170,18 @@ def test_a_failing_bus_disarms() -> None:
     run_session(scenario)
 
 
-def test_close_releases_a_port_that_finished_opening_after_the_arm_was_cancelled() -> None:
-    async def main() -> None:
-        bus = FakeBus()
-        opened = threading.Event()
-        release = threading.Event()
-        real_open = bus.open_drive
-
-        def slow_open(owner):
-            opened.set()
-            release.wait()
-            real_open(owner)
-
-        bus.open_drive = slow_open
-        session = DriveSession(bus, Notes())
-        arming = asyncio.create_task(session.arm())
-        await asyncio.to_thread(opened.wait)
-        arming.cancel()
-        # The connection is gone, but the thread is still opening the port.
-        closing = asyncio.create_task(session.close())
-        await asyncio.sleep(0.01)
-        release.set()
-        await closing
+def test_close_releases_the_bus_however_the_session_ends() -> None:
+    async def scenario(session, bus, notes):
+        await session.arm()
+        session.command(1.0, 0.0)
+        await settle(lambda: bus.commands)
+        # No disarm, no notice to the page: the connection just ended.
+        await session.close()
         assert bus.owner is None
         assert bus.closes == 1
+        assert notes == [{"type": "drive", "armed": True, "detail": "Driving"}]
 
-    asyncio.run(main())
+    run_session(scenario)
 
 
 class QueueSocket:

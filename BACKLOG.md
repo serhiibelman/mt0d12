@@ -169,6 +169,94 @@ that would hurt to lose.
   the install, startup time and memory on 512 MB, and a clean SIGTERM with the
   page open.
 
+---
+
+## Ideas, later
+
+Not scheduled; picked up when the items above are done or one of these starts
+to hurt. Safety first, then the rest roughly by what it unlocks.
+
+### Auth for driving
+
+**Where:** `apps/api/dependencies.py`, `apps/api/routes/status.py` · **Size:** S
+
+Anyone on the same Wi-Fi can open the status page, press Arm and drive. A
+token checked in a dependency during the `/ws/status` handshake closes that;
+watching can stay open and only `arm` needs the token. `/motors/start` wants
+the same check.
+
+### Stop on tilt
+
+**Where:** `apps/api/services/drive.py`, `apps/vehicle_control/` · **Size:** S
+
+Attitude already arrives from the FC; past a roll or pitch limit the motors
+should stop, rather than keep spinning with the rover on its side. Both drive
+paths need it - the page and the gamepad. The first consumer of the "new FC
+reading" event `docs/fc-stream.md` deferred.
+
+### Battery-aware limits
+
+**Where:** `apps/api/services/drive.py`, `apps/vehicle_control/` · **Size:** S
+
+Scale `MAX_RPM` down as the voltage sags and refuse to arm below a critical
+level, so the rover does not brown out mid-drive or run the pack flat.
+
+### Motor feedback
+
+**Where:** `lib/ddsm115/`, `apps/api/services/vehicle_status.py` · **Size:** M
+
+Every DDSM115 reply carries speed, current and position, and only the current
+is kept today. Real per-wheel RPM and current on the page; a stall - high
+current, near-zero speed - stops the drive before a motor cooks; wheel
+positions give odometry, which the ultrasonic sensors' mapping will want.
+
+### Heading hold
+
+**Where:** `apps/api/services/drive.py`, new `lib/` controller · **Size:** M
+
+With the steer stick centred, a PID on the FC's yaw holds the current heading
+and corrects for one side pulling. A fixed-rate task on the loop; needs
+`ATTITUDE` faster than the FC's default stream rate.
+
+### Gamepad in the browser
+
+**Where:** `apps/api/static/status.html` · **Size:** S
+
+The Gamepad API reads a pad plugged into the laptop and can send the same
+`drive` commands over `/ws/status`, with no change to the server and no
+separate `apps/controller` process.
+
+### Speed modes
+
+**Where:** `apps/api/static/status.html`, `apps/api/services/drive.py` · **Size:** XS
+
+Slow / normal / fast as a multiplier on `MAX_RPM`; slow is for indoors and
+first tests.
+
+### HUD over the video
+
+**Where:** `apps/api/static/status.html` · **Size:** S
+
+Artificial horizon, battery and speed drawn on a `<canvas>` over the MJPEG
+stream. The browser does the drawing, so the Pi pays nothing.
+
+### Trip log
+
+**Where:** new `apps/api/services/`, `apps/api/static/` · **Size:** M
+
+Record each session from arm to disarm - commands, real RPM, attitude,
+battery - and replay it as a chart. What tuning the ramp or the heading PID
+needs, and how to answer "why did it jerk then".
+
+### Snapshot on event
+
+**Where:** `apps/api/services/camera.py`, `apps/api/services/drive.py` · **Size:** S
+
+A camera frame saved whenever the drive stops for a reason - link lost, tilt,
+stall - so there is a picture of what happened.
+
+---
+
 ## If the fleet grows past one rover
 
 Not needed now; the numbers change at scale.

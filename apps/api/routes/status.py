@@ -15,7 +15,7 @@ router = APIRouter()
 
 
 @router.get("/status", response_model=VehicleStatusResponse)
-def status(service: VehicleStatusServiceDep) -> VehicleStatusResponse:
+async def status(service: VehicleStatusServiceDep) -> VehicleStatusResponse:
     return VehicleStatusResponse.from_snapshot(service.snapshot())
 
 
@@ -35,7 +35,7 @@ async def status_stream(
     """
     await websocket.accept()
     send = locked_sender(websocket)
-    session = DriveSession(service, notify=lambda state: send(json.dumps(state)))
+    session = DriveSession(service.bus, notify=lambda state: send(json.dumps(state)))
     try:
         with broadcaster.subscribe() as updates:
             await serve_until_disconnect(websocket, send, updates, session, link_timeout)

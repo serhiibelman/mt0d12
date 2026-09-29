@@ -2,7 +2,8 @@
 
 This project uses a **split control setup**:
 
-1. The **Raspberry Pi on the vehicle** runs the motor control loop.
+1. The **Raspberry Pi on the vehicle** runs the motor control loop, as part of
+   the one rover process.
 2. A **laptop or another computer** reads the USB/Bluetooth gamepad.
 3. The laptop sends controller state over **UDP** to the Raspberry Pi.
 
@@ -13,17 +14,19 @@ This project uses a **split control setup**:
 Run on the Raspberry Pi:
 
 ```bash
-./start_vehicle.sh
+./start_rover.sh
 ```
 
-That starts `python -m apps.vehicle_control.main`, which:
+That starts `python -m apps.rover.main` - the status page, telemetry and the
+rest run in the same process (see [one-process.md](one-process.md)). For the
+gamepad it:
 
-1. Opens the DDS115 motor bus.
-2. Starts a UDP receiver on port `5005` - an asyncio `DatagramProtocol`, so each
+1. Starts a UDP receiver on port `5005` - an asyncio `DatagramProtocol`, so each
    packet is handled as it lands rather than on a 20 Hz poll.
-3. Converts incoming gamepad state into left/right motor RPM commands. The
-   motor writes run in a worker thread, so a slow or silent motor never stalls
-   the event loop; packets that land meanwhile collapse to the newest one.
+2. Converts incoming gamepad state into left/right motor RPM commands, sent
+   through the rover's one motor bus. The bus writes on its own thread, so a
+   slow or silent motor never stalls the event loop; packets that land
+   meanwhile collapse to the newest one.
 
 ### Controller side
 
@@ -45,8 +48,14 @@ If your Raspberry Pi is not reachable as `raspberrypi.local`, update `UDP_HOST` 
 
 ### Safety / mode
 
-1. **A button**: toggle drive mode on or off.
-2. **LB button**: apply brake to all motors and disable drive mode.
+1. **A button**: toggle drive mode on or off. The gamepad shares the motor bus
+   with the status page and `/motors/start`, one at a time: turning drive on
+   takes the bus, and is refused - "Cannot drive: A viewer on the status page
+   is driving" in the log - while someone else has it. Turning drive off hands
+   it back once the motors have ramped to zero.
+2. **LB button**: apply brake to all motors and disable drive mode. Only while
+   drive mode is on: with it off, the gamepad does not hold the bus and sends
+   nothing.
 3. **Link-drop stop**: if no packet arrives for 0.5s (Wi-Fi drop, laptop asleep,
    controller process killed), the vehicle stops all motors and turns drive mode
    off. When packets resume, press **A** again to drive - a stick still held
@@ -65,7 +74,7 @@ If your Raspberry Pi is not reachable as `raspberrypi.local`, update `UDP_HOST` 
 
 1. Power the vehicle and make sure the Raspberry Pi is up.
 2. SSH into the Raspberry Pi if you want to watch logs.
-3. Start the vehicle process with `./start_vehicle.sh`.
+3. Start the rover with `./start_rover.sh`, unless it already runs as a service.
 4. Connect the gamepad to the laptop.
 5. Start the controller process with `./start_controller.sh`.
 6. Press **A** once to enable drive mode.
@@ -78,4 +87,4 @@ If your Raspberry Pi is not reachable as `raspberrypi.local`, update `UDP_HOST` 
 2. When drive mode is turned off, RPM ramps back to zero gradually.
 3. The control loop ignores small stick jitter near center with a dead zone.
 4. If the laptop loses network connectivity, UDP packets stop arriving and the vehicle will no longer receive fresh control updates.
-5. `Ctrl+C` stops either side; on vehicle shutdown the motor controller sends `rpm=0` to all motors.
+5. `Ctrl+C` stops either side; on vehicle shutdown the rover sends `rpm=0` to all motors before it stops anything else.

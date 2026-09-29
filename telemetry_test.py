@@ -1,6 +1,6 @@
 """One-shot check that this machine can publish to AWS IoT Core.
 
-Run on the Pi from the project root, before starting the API:
+Run on the Pi from the project root, before starting the rover:
 
     python telemetry_test.py
 
@@ -9,7 +9,7 @@ reports what is missing, and publishes a single test message.
 
 Spooling is switched off here on purpose: this asks "can this machine reach
 IoT Core right now", so a failure has to be a failure, not a message parked in
-the vehicle's spool for the API to deliver later.
+the vehicle's spool for the rover to deliver later.
 """
 
 import asyncio

@@ -126,8 +126,8 @@ def test_camera_start_and_stop_endpoints(build_app, camera_service) -> None:
     assert start_response.json()["running"] is True
     assert stop_response.json()["running"] is False
     assert camera_service.start_calls == 1
-    # The app also stops the camera on shutdown.
-    assert camera_service.stop_calls == 2
+    # Only the route: stopping the camera on shutdown is the rover's job now.
+    assert camera_service.stop_calls == 1
 
 
 def test_root_serves_the_status_page(build_app) -> None:
@@ -211,11 +211,11 @@ def test_arming_and_driving_moves_the_motors(build_app, vehicle_service) -> None
         ws.send_json({"type": "arm"})
         assert next_drive_state(ws) == {"type": "drive", "armed": True, "detail": "Driving"}
         ws.send_json({"type": "drive", "throttle": 1.0, "steer": 0.0})
-        wait_for(lambda: vehicle_service.drive_commands)
+        wait_for(lambda: vehicle_service.bus.commands)
         # Status keeps coming while driving.
         assert "battery" in ws.receive_json()
 
-    assert vehicle_service.drive_commands[0] == (5, 5)
+    assert vehicle_service.bus.commands[0] == (5, 5)
 
 
 def test_drive_commands_without_arming_are_ignored(build_app, vehicle_service) -> None:
@@ -224,8 +224,8 @@ def test_drive_commands_without_arming_are_ignored(build_app, vehicle_service) -
         ws.receive_json()
         ws.receive_json()
 
-    assert vehicle_service.drive_commands == []
-    assert vehicle_service.drive_owner is None
+    assert vehicle_service.bus.commands == []
+    assert vehicle_service.bus.holder is None
 
 
 def test_malformed_commands_do_not_break_the_stream(build_app, vehicle_service) -> None:
@@ -236,9 +236,9 @@ def test_malformed_commands_do_not_break_the_stream(build_app, vehicle_service) 
             ws.send_text(junk)
         ws.send_bytes(b"\x00")
         ws.send_json({"type": "drive", "throttle": 0.0, "steer": 0.5})
-        wait_for(lambda: vehicle_service.drive_commands)
+        wait_for(lambda: vehicle_service.bus.commands)
 
-    assert vehicle_service.drive_commands == [(50, -50)]
+    assert vehicle_service.bus.commands == [(50, -50)]
 
 
 def test_stop_disarms_and_releases_the_bus(build_app, vehicle_service) -> None:
@@ -247,7 +247,7 @@ def test_stop_disarms_and_releases_the_bus(build_app, vehicle_service) -> None:
         next_drive_state(ws)
         ws.send_json({"type": "stop"})
         assert next_drive_state(ws) == {"type": "drive", "armed": False, "detail": "Stopped"}
-        assert vehicle_service.drive_owner is None
+        assert vehicle_service.bus.holder is None
 
 
 def test_leaving_while_driving_stops_the_motors(build_app, vehicle_service) -> None:
@@ -256,10 +256,10 @@ def test_leaving_while_driving_stops_the_motors(build_app, vehicle_service) -> N
             ws.send_json({"type": "arm"})
             next_drive_state(ws)
             ws.send_json({"type": "drive", "throttle": 1.0, "steer": 0.0})
-            wait_for(lambda: vehicle_service.drive_commands)
-        wait_for(lambda: vehicle_service.drive_owner is None)
+            wait_for(lambda: vehicle_service.bus.commands)
+        wait_for(lambda: vehicle_service.bus.holder is None)
 
-    assert vehicle_service.drive_closes == 1
+    assert vehicle_service.bus.releases == 1
 
 
 def test_a_silent_driver_is_stopped(build_app, vehicle_service) -> None:
@@ -271,12 +271,12 @@ def test_a_silent_driver_is_stopped(build_app, vehicle_service) -> None:
         state = next_drive_state(ws)
         assert state["armed"] is False
         assert "No command for 0.05s" in state["detail"]
-        assert vehicle_service.drive_owner is None
+        assert vehicle_service.bus.holder is None
         # Commands after the link comes back move nothing until armed again.
         ws.send_json({"type": "drive", "throttle": 1.0, "steer": 0.0})
         ws.receive_json()
         ws.receive_json()
-        assert vehicle_service.drive_commands == []
+        assert vehicle_service.bus.commands == []
 
 
 def test_a_watcher_is_never_timed_out(build_app, vehicle_service) -> None:
@@ -298,10 +298,10 @@ def test_a_second_driver_is_refused(build_app, vehicle_service) -> None:
         assert next_drive_state(second) == {
             "type": "drive",
             "armed": False,
-            "detail": "Another viewer is driving",
+            "detail": "A viewer on the status page is driving",
         }
         # The second viewer leaving must not stop the first one's motors.
         second.close()
         first.send_json({"type": "drive", "throttle": 1.0, "steer": 0.0})
-        wait_for(lambda: vehicle_service.drive_commands)
-        assert vehicle_service.drive_closes == 0
+        wait_for(lambda: vehicle_service.bus.commands)
+        assert vehicle_service.bus.releases == 0

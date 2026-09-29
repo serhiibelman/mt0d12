@@ -1,4 +1,12 @@
-import asyncio
+"""
+The web side of the rover: routes over services the rover owns.
+
+The app builds none of its services and starts none of them. `apps/rover`
+creates them, runs them under its supervisor and stops them in order; the
+app only serves them, as one more task in the same process. So a viewer, the
+gamepad and the telemetry all see the same motor bus and the same readings.
+"""
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -13,22 +21,16 @@ from apps.api.services.camera import CameraService
 from apps.api.services.status_broadcaster import StatusBroadcaster
 from apps.api.services.vehicle_status import VehicleStatusService
 from apps.vehicle_control.vehicle_controller import LINK_TIMEOUT
-from lib.telemetry import TelemetryPublisher
 
 
 def create_app(
-    vehicle_status_service: VehicleStatusService | None = None,
-    camera_service: CameraService | None = None,
-    telemetry_publisher: TelemetryPublisher | None = None,
+    *,
+    vehicle_status_service: VehicleStatusService,
+    camera_service: CameraService,
     status_broadcaster: StatusBroadcaster | None = None,
     drive_link_timeout: float = LINK_TIMEOUT,
 ) -> FastAPI:
-    service = vehicle_status_service or VehicleStatusService()
-    camera = camera_service or CameraService()
-    # The publisher lives here rather than in its own process because this one
-    # already owns the motor bus; a second process would fight for the serial
-    # port. With no IOT_ENDPOINT configured it starts and stops as a no-op.
-    telemetry = telemetry_publisher or TelemetryPublisher(snapshot=service.snapshot)
+    service = vehicle_status_service
     # One producer behind /ws/status, rendering the same schema /status returns.
     broadcaster = status_broadcaster or StatusBroadcaster(
         render=lambda: VehicleStatusResponse.from_snapshot(service.snapshot()).json()
@@ -37,27 +39,14 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.vehicle_status_service = service
-        app.state.camera_service = camera
-        app.state.telemetry_publisher = telemetry
+        app.state.camera_service = camera_service
         app.state.status_broadcaster = broadcaster
         # How long a driver may go without a command before the motors stop.
         app.state.drive_link_timeout = drive_link_timeout
-        service.start()
-        await service.start_streams()
-        await telemetry.start()
-        # The camera opens on the first stream/snapshot request instead of at
-        # boot, so the sensor stays powered down while nobody is watching. Its
-        # library loads now, in the background, as that is the slow part.
-        preload = asyncio.create_task(asyncio.to_thread(camera.preload))
         try:
             yield
         finally:
-            await preload
             await broadcaster.stop()
-            await telemetry.stop()
-            await service.stop_streams()
-            service.stop()
-            camera.stop()
 
     app = FastAPI(
         title="MT0D12 Vehicle API",
@@ -71,6 +60,3 @@ def create_app(
     app.include_router(pages_router)
     app.include_router(status_router)
     return app
-
-
-app = create_app()

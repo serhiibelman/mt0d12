@@ -1,5 +1,4 @@
 from fastapi import APIRouter, HTTPException, Response, status
-from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 
@@ -21,7 +20,7 @@ async def stream(service: CameraServiceDep) -> StreamingResponse:
     """`async def`, so a viewer waits for frames as a coroutine; only opening
     the camera, which blocks for a second or so, goes to a thread."""
     try:
-        await run_in_threadpool(service.acquire_client_slot)
+        await service.acquire_client_slot()
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -37,9 +36,9 @@ async def stream(service: CameraServiceDep) -> StreamingResponse:
 
 
 @router.get("/snapshot")
-def snapshot(service: CameraServiceDep) -> Response:
+async def snapshot(service: CameraServiceDep) -> Response:
     try:
-        frame = service.capture_frame()
+        frame = await service.capture_frame()
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -49,14 +48,14 @@ def snapshot(service: CameraServiceDep) -> Response:
 
 
 @router.get("/status", response_model=CameraStatusResponse)
-def camera_status(service: CameraServiceDep) -> CameraStatusResponse:
+async def camera_status(service: CameraServiceDep) -> CameraStatusResponse:
     return CameraStatusResponse(**service.snapshot())
 
 
 @router.post("/start", response_model=CameraCommandResponse)
-def start_camera(service: CameraServiceDep) -> CameraCommandResponse:
+async def start_camera(service: CameraServiceDep) -> CameraCommandResponse:
     try:
-        result = service.start()
+        result = await service.start()
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -66,9 +65,9 @@ def start_camera(service: CameraServiceDep) -> CameraCommandResponse:
 
 
 @router.post("/stop", response_model=CameraCommandResponse)
-def stop_camera(service: CameraServiceDep) -> CameraCommandResponse:
+async def stop_camera(service: CameraServiceDep) -> CameraCommandResponse:
     try:
-        result = service.stop()
+        result = await service.stop()
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

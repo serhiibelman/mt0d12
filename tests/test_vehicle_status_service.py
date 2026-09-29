@@ -1,208 +1,115 @@
+import asyncio
+
+import pytest
+
+from apps.api.services.flight_controller import FlightControllerStream
 from apps.api.services.vehicle_status import VehicleStatusService
+from lib.ddsm115 import MotorBus
 
 
-class FakeMotor:
-    def __init__(self, device: str):
-        self.device = device
-        self.commands: list[tuple[int, int]] = []
-        self.closed = False
+def make_service(bus: MotorBus, **kwargs) -> VehicleStatusService:
+    async def no_pi() -> dict:
+        return {}
 
-    def send_rpm(self, motor_id: int, rpm: int = 0) -> None:
-        self.commands.append((motor_id, rpm))
-
-    def close(self) -> None:
-        self.closed = True
-
-
-def test_start_motors_ramps_all_motors() -> None:
-    motors: list[FakeMotor] = []
-
-    def motor_factory(*, device: str) -> FakeMotor:
-        motor = FakeMotor(device)
-        motors.append(motor)
-        return motor
-
-    service = VehicleStatusService(
-        motor_device="/dev/test",
-        fc_device=None,
-        motor_factory=motor_factory,
-        sleep_func=lambda _: None,
+    return VehicleStatusService(
+        bus=bus,
+        flight_controller=FlightControllerStream(device=None),
+        ramp_interval=0,
+        pi_health_reader=no_pi,
+        **kwargs,
     )
 
-    response = service.start_motors(12)
 
-    assert response["action"] == "start"
-    assert response["current_rpm"] == 12
-    assert len(motors) == 1
-    assert motors[0].closed is True
-    assert motors[0].commands == [
-        (3, 5),
-        (4, 5),
-        (1, -5),
-        (2, -5),
-        (3, 10),
-        (4, 10),
-        (1, -10),
-        (2, -10),
-        (3, 12),
-        (4, 12),
-        (1, -12),
-        (2, -12),
-    ]
+# -- the /motors ramps, through the shared bus -------------------------------
 
 
-def test_stop_motors_ramps_down_from_current_speed() -> None:
-    motors: list[FakeMotor] = []
+def test_start_motors_ramps_all_motors(running_bus) -> None:
+    async def main():
+        async with running_bus() as (bus, motors):
+            service = make_service(bus)
 
-    def motor_factory(*, device: str) -> FakeMotor:
-        motor = FakeMotor(device)
-        motors.append(motor)
-        return motor
+            response = await service.start_motors(12)
 
-    service = VehicleStatusService(
-        motor_device="/dev/test",
-        fc_device=None,
-        motor_factory=motor_factory,
-        sleep_func=lambda _: None,
-    )
+            assert response["action"] == "start"
+            assert response["current_rpm"] == 12
+            assert motors[0].commands == [
+                (3, 5),
+                (4, 5),
+                (1, -5),
+                (2, -5),
+                (3, 10),
+                (4, 10),
+                (1, -10),
+                (2, -10),
+                (3, 12),
+                (4, 12),
+                (1, -12),
+                (2, -12),
+            ]
+            # Left turning, and nobody holding the bus.
+            assert bus.holder_name is None
 
-    service.start_motors(12)
-    response = service.stop_motors()
-
-    assert response["action"] == "stop"
-    assert response["current_rpm"] == 0
-    assert len(motors) == 2
-    assert motors[1].commands == [
-        (3, 7),
-        (4, 7),
-        (1, -7),
-        (2, -7),
-        (3, 2),
-        (4, 2),
-        (1, -2),
-        (2, -2),
-        (3, 0),
-        (4, 0),
-        (1, 0),
-        (2, 0),
-    ]
+    asyncio.run(main())
 
 
-# -- driving from the status page -------------------------------------------
+def test_stop_motors_ramps_down_from_current_speed(running_bus) -> None:
+    async def main():
+        async with running_bus() as (bus, motors):
+            service = make_service(bus)
+            await service.start_motors(12)
+            motors[0].commands.clear()
+
+            response = await service.stop_motors()
+
+            assert response["action"] == "stop"
+            assert response["current_rpm"] == 0
+            assert motors[0].commands == [
+                (3, 7),
+                (4, 7),
+                (1, -7),
+                (2, -7),
+                (3, 2),
+                (4, 2),
+                (1, -2),
+                (2, -2),
+                (3, 0),
+                (4, 0),
+                (1, 0),
+                (2, 0),
+            ]
+
+    asyncio.run(main())
 
 
-def make_drive_service() -> tuple[VehicleStatusService, list[FakeMotor]]:
-    motors: list[FakeMotor] = []
+def test_a_ramp_is_refused_while_someone_drives(running_bus) -> None:
+    async def main():
+        async with running_bus() as (bus, _):
+            service = make_service(bus)
+            bus.claim(object(), "The gamepad")
 
-    def motor_factory(*, device: str) -> FakeMotor:
-        motor = FakeMotor(device)
-        motors.append(motor)
-        return motor
+            with pytest.raises(RuntimeError, match="The gamepad is driving"):
+                await service.start_motors(50)
 
-    service = VehicleStatusService(
-        motor_device="/dev/test",
-        fc_device=None,
-        motor_factory=motor_factory,
-        sleep_func=lambda _: None,
-        pi_health_reader=dict,
-    )
-    return service, motors
+    asyncio.run(main())
 
 
-def test_a_driver_holds_one_port_open_for_the_whole_session() -> None:
-    service, motors = make_drive_service()
-    driver = object()
+def test_the_snapshot_shows_the_bus_and_what_was_sent(running_bus) -> None:
+    async def main():
+        async with running_bus() as (bus, _):
+            service = make_service(bus)
+            driver = object()
+            bus.claim(driver, "A viewer on the status page")
+            await bus.drive(driver, 60, 40)
 
-    service.open_drive(driver)
-    service.drive(driver, 50, 30)
-    service.drive(driver, 60, 40)
+            snapshot = service.snapshot()
 
-    assert len(motors) == 1
-    assert motors[0].closed is False
-    # Right side negated for its mounting, as everywhere else.
-    assert motors[0].commands == [(3, 50), (4, 50), (1, -30), (2, -30)] + [
-        (3, 60),
-        (4, 60),
-        (1, -40),
-        (2, -40),
-    ]
-    assert [m["rpm"] for m in service.snapshot()["motor_feedback"]] == [60, 60, -40, -40]
+            assert snapshot["components"]["motor_bus"]["connected"] is True
+            assert snapshot["components"]["motor_bus"]["detail"] == (
+                "A viewer on the status page is driving"
+            )
+            assert [m["rpm"] for m in snapshot["motor_feedback"]] == [60, 60, -40, -40]
 
-
-def test_closing_the_drive_stops_the_motors_and_releases_the_port() -> None:
-    service, motors = make_drive_service()
-    driver = object()
-    service.open_drive(driver)
-    service.drive(driver, 50, 50)
-
-    service.close_drive(driver)
-
-    assert motors[0].commands[-4:] == [(3, 0), (4, 0), (1, 0), (2, 0)]
-    assert motors[0].closed is True
-    # Closed means closed: a command still in flight when it happened is dropped.
-    service.drive(driver, 50, 50)
-    assert motors[0].commands[-1] == (2, 0)
-
-
-def test_only_one_driver_at_a_time() -> None:
-    service, _ = make_drive_service()
-    first, second = object(), object()
-    service.open_drive(first)
-
-    try:
-        service.open_drive(second)
-    except RuntimeError as exc:
-        assert "Another viewer is driving" in str(exc)
-    else:
-        raise AssertionError("a second driver must be refused")
-
-
-def test_a_session_that_ended_cannot_touch_the_next_ones_bus() -> None:
-    service, motors = make_drive_service()
-    old, new = object(), object()
-    service.open_drive(old)
-    service.close_drive(old)
-    service.open_drive(new)
-
-    service.drive(old, 100, 100)
-    service.close_drive(old)
-
-    assert motors[1].commands == []
-    assert motors[1].closed is False
-
-
-def test_a_ramp_is_refused_while_someone_drives() -> None:
-    service, _ = make_drive_service()
-    service.open_drive(object())
-
-    try:
-        service.start_motors(50)
-    except RuntimeError as exc:
-        assert "being driven" in str(exc)
-    else:
-        raise AssertionError("/motors/start must not share the bus with a driver")
-
-
-def test_the_probe_does_not_reopen_a_port_a_driver_holds() -> None:
-    service, motors = make_drive_service()
-    service.open_drive(object())
-
-    service._probe_once()
-
-    assert len(motors) == 1
-    assert service.snapshot()["components"]["motor_bus"]["connected"] is True
-
-
-def test_stopping_the_service_stops_a_driver_that_is_still_going() -> None:
-    service, motors = make_drive_service()
-    driver = object()
-    service.open_drive(driver)
-    service.drive(driver, 80, 80)
-
-    service.stop()
-
-    assert motors[0].commands[-4:] == [(3, 0), (4, 0), (1, 0), (2, 0)]
-    assert motors[0].closed is True
+    asyncio.run(main())
 
 
 # -- the flight controller, through the service ---------------------------
@@ -210,16 +117,41 @@ def test_stopping_the_service_stops_a_driver_that_is_still_going() -> None:
 
 
 def test_an_unconfigured_flight_controller_reports_nothing_known() -> None:
-    service = VehicleStatusService(motor_device=None, fc_device=None, sleep_func=lambda _: None)
-    service._probe_once()
+    async def main():
+        service = make_service(MotorBus(device=None))
+        await service.probe_once()
 
-    snapshot = service.snapshot()
+        snapshot = service.snapshot()
 
-    assert snapshot["battery"] == {
-        "voltage_v": None,
-        "current_a": None,
-        "remaining_percent": None,
-    }
-    assert snapshot["attitude"] == {"roll_deg": None, "pitch_deg": None, "yaw_deg": None}
-    assert snapshot["components"]["flight_controller"]["configured"] is False
-    assert snapshot["overall_status"] == "degraded"
+        assert snapshot["battery"] == {
+            "voltage_v": None,
+            "current_a": None,
+            "remaining_percent": None,
+        }
+        assert snapshot["attitude"] == {"roll_deg": None, "pitch_deg": None, "yaw_deg": None}
+        assert snapshot["components"]["flight_controller"]["configured"] is False
+        assert snapshot["overall_status"] == "degraded"
+
+    asyncio.run(main())
+
+
+def test_the_probe_reads_the_pi_until_cancelled() -> None:
+    async def main():
+        readings = []
+
+        async def reader() -> dict:
+            readings.append(1)
+            return {"cpu_temp_c": 50.0 + len(readings)}
+
+        service = make_service(MotorBus(device=None), probe_interval_seconds=0.01)
+        service._read_pi_health = reader
+        task = asyncio.create_task(service.run())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert len(readings) >= 3
+        assert service.snapshot()["pi"]["cpu_temp_c"] == 50.0 + len(readings)
+
+    asyncio.run(main())

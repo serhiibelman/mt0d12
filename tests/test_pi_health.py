@@ -1,3 +1,4 @@
+import asyncio
 from collections import namedtuple
 
 import pytest
@@ -7,7 +8,9 @@ from apps.api.services.pi_health import (
     PiHealthReader,
     parse_throttled,
 )
+from apps.api.services.flight_controller import FlightControllerStream
 from apps.api.services.vehicle_status import VehicleStatusService
+from lib.ddsm115 import MotorBus
 
 MEMINFO = """MemTotal:         444764 kB
 MemFree:           61236 kB
@@ -40,12 +43,16 @@ def make_reader(board, **overrides):
     return PiHealthReader(**fields)
 
 
-def _no_vcgencmd() -> str:
+async def _no_vcgencmd() -> str:
     raise FileNotFoundError("vcgencmd")
 
 
+def read(reader) -> dict:
+    return asyncio.run(reader())
+
+
 def test_gauges_come_out_in_the_units_their_names_say(board) -> None:
-    health = make_reader(board)()
+    health = read(make_reader(board))
 
     assert health["cpu_temp_c"] == 51.5
     assert health["load_1m"] == 0.42
@@ -70,7 +77,7 @@ def test_a_brownout_that_has_passed_still_shows_since_boot(board) -> None:
     # voltage recovered, and nothing on the running Pi says why.
     board["throttled_path"].write_text("50000\n")
 
-    health = make_reader(board)()
+    health = read(make_reader(board))
 
     assert health["throttled_raw"] == "0x50000"
     assert health["undervoltage_now"] is False
@@ -83,7 +90,7 @@ def test_a_brownout_that_has_passed_still_shows_since_boot(board) -> None:
 def test_undervoltage_right_now_is_a_warning(board) -> None:
     board["throttled_path"].write_text("50005\n")
 
-    health = make_reader(board)()
+    health = read(make_reader(board))
 
     assert health["undervoltage_now"] is True
     assert health["throttled_now"] is True
@@ -93,7 +100,10 @@ def test_undervoltage_right_now_is_a_warning(board) -> None:
 def test_vcgencmd_is_the_fallback_when_sysfs_has_no_throttle_file(board, tmp_path) -> None:
     board["throttled_path"] = tmp_path / "missing"
 
-    health = make_reader(board, run_vcgencmd=lambda: "throttled=0x1\n")()
+    async def vcgencmd() -> str:
+        return "throttled=0x1\n"
+
+    health = read(make_reader(board, run_vcgencmd=vcgencmd))
 
     assert health["undervoltage_now"] is True
 
@@ -103,13 +113,13 @@ def test_a_missing_vcgencmd_is_not_spawned_again(board, tmp_path) -> None:
     board["throttled_path"] = tmp_path / "missing"
     calls = []
 
-    def vcgencmd() -> str:
+    async def vcgencmd() -> str:
         calls.append(1)
         raise FileNotFoundError("vcgencmd")
 
     reader = make_reader(board, run_vcgencmd=vcgencmd)
-    reader()
-    health = reader()
+    read(reader)
+    health = read(reader)
 
     assert len(calls) == 1
     assert health["throttled_raw"] is None
@@ -124,7 +134,7 @@ def test_thresholds_raise_warnings(board, monkeypatch) -> None:
         lambda _path: DiskUsage(total=16_000 * 2**20, used=15_000 * 2**20, free=1_000 * 2**20),
     )
 
-    health = make_reader(board)()
+    health = read(make_reader(board))
 
     assert health["warnings"] == ["cpu_hot", "disk_low", "memory_low"]
 
@@ -138,7 +148,7 @@ def test_off_a_pi_the_missing_readings_are_null_not_errors(tmp_path) -> None:
         run_vcgencmd=_no_vcgencmd,
     )
 
-    health = reader()
+    health = read(reader)
 
     assert health["cpu_temp_c"] is None
     assert health["memory_available_mb"] is None
@@ -152,23 +162,31 @@ def test_off_a_pi_the_missing_readings_are_null_not_errors(tmp_path) -> None:
 
 def test_the_probe_puts_pi_health_in_the_snapshot() -> None:
     reading = {**PI_HEALTH_UNAVAILABLE, "cpu_temp_c": 55.0, "warnings": []}
-    service = VehicleStatusService(
-        motor_device=None, fc_device=None, pi_health_reader=lambda: reading
-    )
 
-    service._probe_once()
+    async def reader() -> dict:
+        return reading
+
+    service = make_service(reader)
+    asyncio.run(service.probe_once())
 
     assert service.snapshot()["pi"]["cpu_temp_c"] == 55.0
 
 
 def test_a_failing_reader_does_not_cost_the_rest_of_the_probe() -> None:
-    def broken() -> dict:
+    async def broken() -> dict:
         raise RuntimeError("boom")
 
-    service = VehicleStatusService(motor_device=None, fc_device=None, pi_health_reader=broken)
-
-    service._probe_once()
+    service = make_service(broken)
+    asyncio.run(service.probe_once())
     snapshot = service.snapshot()
 
     assert snapshot["pi"] == PI_HEALTH_UNAVAILABLE
     assert snapshot["components"]["motor_bus"]["detail"] == "DEVICE is not configured"
+
+
+def make_service(reader) -> VehicleStatusService:
+    return VehicleStatusService(
+        bus=MotorBus(device=None),
+        flight_controller=FlightControllerStream(device=None),
+        pi_health_reader=reader,
+    )
